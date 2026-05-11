@@ -296,6 +296,32 @@ def display_host(host):
     print()
 
 # ----------------------------------------------------------------
+# Terminal background color helpers
+# ----------------------------------------------------------------
+def set_terminal_bg(color_hex):
+    """Set terminal background color via OSC 11 sequence."""
+    sys.stdout.write(f"\033]11;{color_hex}\007")
+    sys.stdout.flush()
+
+def reset_terminal_bg():
+    """Reset terminal background to default via OSC 11 sequence."""
+    sys.stdout.write("\033]11;default\007")
+    sys.stdout.flush()
+
+def terminal_bg_for_alias(alias):
+    """Return a background color hex string based on the alias name."""
+    a = alias.lower()
+    if 'prod' in a:
+        return '#CC0000'      # Red for production
+    if 'test' in a or 'staging' in a or 'dr' in a:
+        return '#FF8800'      # Orange for test/staging/DR
+    if 'dev' in a or 'lab' in a:
+        return '#008800'      # Green for dev/lab
+    if 'bastion' in a:
+        return '#CCCC00'      # Yellow for bastions
+    return '#0066CC'          # Blue default
+
+# ----------------------------------------------------------------
 # fzf helper
 # ----------------------------------------------------------------
 def fzf_select(items, prompt_str="", preview_cmd=None):
@@ -467,7 +493,15 @@ def cmd_connect(args):
     alias = resolve_alias(real, args.alias, "Conectar a> ")
     h = require_host(real, alias)
     print(f"\n{C.BOLD}Conectando a {alias}...{C.RESET}")
-    subprocess.run(['ssh', alias])
+
+    if sys.stdout.isatty():
+        set_terminal_bg(terminal_bg_for_alias(alias))
+        try:
+            subprocess.run(['ssh', alias])
+        finally:
+            reset_terminal_bg()
+    else:
+        subprocess.run(['ssh', alias])
 
 # ----------------------------------------------------------------
 # -show

@@ -1,0 +1,750 @@
+#!/usr/bin/env python3
+"""
+sshman — Gestor de conexiones SSH
+PolluxData / Jota
+
+Uso:
+  sshman -list
+  sshman -list --plain
+  sshman -connect
+  sshman -connect -alias polluxdata-sites
+  sshman -add
+  sshman -add -alias ucuenca-prod-nuevo -host 172.30.1.1 -user opc
+  sshman -add -alias ucuenca-prod-nuevo -host 172.30.1.1 -user opc -key ~/.ssh/keys/UCUENCA/PROD/nuevo.pem -jump opc@129.213.100.82:22
+  sshman -remove
+  sshman -remove -alias ucuenca-prod-nuevo
+  sshman -edit
+  sshman -edit -alias ucuenca-prod-nuevo
+  sshman -show -alias polluxdata-sites
+  sshman -test -alias polluxdata-sites
+"""
+
+import argparse
+import os
+import re
+import shutil
+import subprocess
+import sys
+from datetime import datetime
+from pathlib import Path
+
+SSH_CONFIG = Path.home() / ".ssh" / "config"
+BACKUP_DIR = Path.home() / ".ssh" / "backups"
+
+# ----------------------------------------------------------------
+# Colores ANSI
+# ----------------------------------------------------------------
+class C:
+    RED    = "\033[31m"
+    GREEN  = "\033[32m"
+    YELLOW = "\033[33m"
+    CYAN   = "\033[36m"
+    BOLD   = "\033[1m"
+    DIM    = "\033[2m"
+    RESET  = "\033[0m"
+
+def ok(msg):   print(f"{C.GREEN}[OK]{C.RESET}  {msg}")
+def err(msg):  print(f"{C.RED}[ERR]{C.RESET} {msg}", file=sys.stderr)
+def warn(msg): print(f"{C.YELLOW}[WARN]{C.RESET} {msg}")
+def info(msg): print(f"{C.CYAN}{msg}{C.RESET}")
+
+# ----------------------------------------------------------------
+# Backup
+# ----------------------------------------------------------------
+def backup_config():
+    BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+    ts  = datetime.now().strftime("%Y%m%d_%H%M%S")
+    dst = BACKUP_DIR / f"config.bak.{ts}"
+    shutil.copy2(SSH_CONFIG, dst)
+    return dst
+
+# ----------------------------------------------------------------
+# Parser del ~/.ssh/config
+# ----------------------------------------------------------------
+KNOWN_SSH_OPTIONS = frozenset([
+    'hostname', 'user', 'port', 'identityfile', 'proxycommand',
+    'proxyjump', 'identitiesonly', 'forwardagent', 'loglevel',
+    'compression', 'clearallforwardings', 'exitonforwardfailure',
+    'checkhostip', 'addressfamily', 'verifyhostkeydns',
+    'strichosts', 'globalknownhostsfile', 'kbdinteractiveauthentication',
+    'kbdinteractivedevices', 'pubkeyauthentication',
+    'authenticationmethods', 'askpassprogram', 'canonicalizehostname',
+    'canonicalizefallbacklocal', 'canonicalizepermittedcnames',
+    'canonicalizemaxdots', 'certificatefile', 'channeltimeout',
+    'casigneralgorithms', 'compressionlevel', 'connectionattempts',
+    'serveraliveinterval', 'serveralivecountmax', 'autosendkey',
+    'identities', 'ipqos', 'escapechar', 'macs', 'ciphers',
+    'kexalgorithms', 'hostkeyalgorithms', 'gssapiauthentication',
+    'gssapidelegatecredentials', 'gssapikeyexchange',
+    'gssapirenewalforcesearch', 'gssapirenewalthreshold',
+    'gssapichallenge', 'hostbasedauthentication', 'hostkeyalias',
+    'enablesshkeysign', 'sshkeysign', 'logintimeout', 'authlogindelay',
+    'batchmode', 'bindaddress', 'bindinterface', 'controlmaster',
+    'controlpath', 'controlpersist', 'connectionbindto',
+    'disableforwardings', 'hashknownhosts', 'identitiesfile',
+    'ignoreunknown', 'include', 'issuercertificatefile', 'markhosts',
+    'nohostauthenticationforlocalhost', 'numberofpasswordprompts',
+    'passwordauthentication', 'pkcs11provider',
+    'pubkeyacceptedalgorithms', 'pubkeyacceptedkeytypes',
+    'requesttty', 'runforwardings', 'sendsig',
+    'streamlocalbindmask', 'streamlocalbindunlink',
+    'syslogfacility', 'tcpkeepalive', 'teratermagent',
+    'tunnel', 'tunneldevice', 'visualhostkey', 'xauthlocation',
+])
+
+def parse_config():
+    """Parse ~/.ssh/config preserving all options and line structure."""
+    hosts    = []
+    current  = None
+    preamble = []
+
+    if not SSH_CONFIG.exists():
+        return [], []
+
+    with open(SSH_CONFIG) as f:
+        for line in f:
+            stripped = line.strip()
+            if not stripped or stripped.startswith('#'):
+                if current is None:
+                    preamble.append(line)
+                continue
+            m = re.match(r'^Host\s+(.+)$', stripped, re.IGNORECASE)
+            if m:
+                if current:
+                    hosts.append(current)
+                current = {'Host': m.group(1).strip(), '_extra': []}
+            elif current is not None:
+                m2 = re.match(r'^(\S+)\s+(.+)$', stripped)
+                if m2:
+                    key = m2.group(1).lower()
+                    val = m2.group(2).strip()
+                    if key in KNOWN_SSH_OPTIONS:
+                        current[key] = val
+                    else:
+                        current['_extra'].append(line)
+                else:
+                    current['_extra'].append(line)
+        if current:
+            hosts.append(current)
+
+    return hosts, preamble
+
+def write_config(hosts, preamble):
+    """Write ~/.ssh/config preserving known options in standard order
+    and dumping unknown/extra options as-is."""
+    bak = backup_config()
+    KEY_ORDER = [
+        'hostname', 'user', 'port', 'identityfile',
+        'proxyjump', 'proxycommand',
+        'identitiesonly', 'forwardagent', 'serveraliveinterval',
+        'serveralivecountmax', 'loglevel', 'compression',
+        'pubkeyauthentication', 'passwordauthentication',
+        'batchmode', 'hashknownhosts', 'streamlocalbindunlink',
+    ]
+    LABEL_MAP = {
+        'hostname':       'HostName',
+        'user':           'User',
+        'port':           'Port',
+        'identityfile':   'IdentityFile',
+        'proxyjump':      'ProxyJump',
+        'proxycommand':   'ProxyCommand',
+        'identitiesonly': 'IdentitiesOnly',
+        'forwardagent':   'ForwardAgent',
+        'serveraliveinterval': 'ServerAliveInterval',
+        'serveralivecountmax': 'ServerAliveCountMax',
+        'loglevel':       'LogLevel',
+        'compression':    'Compression',
+        'pubkeyauthentication': 'PubkeyAuthentication',
+        'passwordauthentication': 'PasswordAuthentication',
+        'batchmode':      'BatchMode',
+        'hashknownhosts': 'HashKnownHosts',
+        'streamlocalbindunlink': 'StreamLocalBindUnlink',
+        'addressfamily':  'AddressFamily',
+        'checkhostip':    'CheckHostIP',
+        'clearallforwardings': 'ClearAllForwardings',
+        'exitonforwardfailure': 'ExitOnForwardFailure',
+        'verifyhostkeydns': 'VerifyHostKeyDNS',
+        'strichosts':     'StrictHosts',
+        'globalknownhostsfile': 'GlobalKnownHostsFile',
+        'kbdinteractiveauthentication': 'KbdInteractiveAuthentication',
+        'kbdinteractivedevices': 'KbdInteractiveDevices',
+        'authenticationmethods': 'AuthenticationMethods',
+        'askpassprogram': 'AskPassProgram',
+        'canonicalizehostname': 'CanonicalizeHostname',
+        'canonicalizefallbacklocal': 'CanonicalizeFallbackLocal',
+        'canonicalizepermittedcnames': 'CanonicalizePermittedCNAMEs',
+        'canonicalizemaxdots': 'CanonicalizeMaxDots',
+        'certificatefile': 'CertificateFile',
+        'channeltimeout': 'ChannelTimeout',
+        'casigneralgorithms': 'CASignatureAlgorithms',
+        'compressionlevel': 'CompressionLevel',
+        'connectionattempts': 'ConnectionAttempts',
+        'autosendkey':    'AutoSendKey',
+        'identities':     'Identities',
+        'ipqos':          'IPQoS',
+        'escapechar':     'EscapeChar',
+        'macs':           'MACs',
+        'ciphers':        'Ciphers',
+        'kexalgorithms':  'KexAlgorithms',
+        'hostkeyalgorithms': 'HostKeyAlgorithms',
+        'gssapiauthentication': 'GSSAPIAuthentication',
+        'gssapidelegatecredentials': 'GSSAPIDelegateCredentials',
+        'gssapikeyexchange': 'GSSAPIKeyExchange',
+        'gssapirenewalforcesearch': 'GSSAPIRenewalForceRealm',
+        'gssapirenewalthreshold': 'GSSAPIRenewalThreshold',
+        'gssapichallenge': 'GSSAPIChallenge',
+        'hostbasedauthentication': 'HostbasedAuthentication',
+        'hostkeyalias':   'HostkeyAlias',
+        'enablesshkeysign': 'EnableSSHKeySign',
+        'sshkeysign':     'SSHKeySign',
+        'logintimeout':   'LoginTimeout',
+        'authlogindelay': 'AuthLogDelay',
+        'bindaddress':    'BindAddress',
+        'bindinterface':  'BindInterface',
+        'controlmaster':  'ControlMaster',
+        'controlpath':    'ControlPath',
+        'controlpersist': 'ControlPersist',
+        'connectionbindto': 'ConnectionBindTo',
+        'disableforwardings': 'DisableForwardings',
+        'identitiesfile': 'IdentitiesFile',
+        'ignoreunknown':  'IgnoreUnknown',
+        'include':        'Include',
+        'issuercertificatefile': 'IssuerCertificateFile',
+        'markhosts':      'MarkHosts',
+        'nohostauthenticationforlocalhost': 'NoHostAuthenticationForLocalhost',
+        'numberofpasswordprompts': 'NumberOfPasswordPrompts',
+        'pkcs11provider': 'PKCS11Provider',
+        'pubkeyacceptedalgorithms': 'PubkeyAcceptedAlgorithms',
+        'pubkeyacceptedkeytypes': 'PubkeyAcceptedKeyTypes',
+        'requesttty':     'RequestTTY',
+        'runforwardings': 'RunForwards',
+        'sendsig':        'SendSig',
+        'streamlocalbindmask': 'StreamLocalBindMask',
+        'syslogfacility': 'SyslogFacility',
+        'tcpkeepalive':   'TCPKeepAlive',
+        'teratermagent':  'TeraTermAgent',
+        'tunnel':         'Tunnel',
+        'tunneldevice':   'TunnelDevice',
+        'visualhostkey':  'VisualHostKey',
+        'xauthlocation':  'XAuthLocation',
+    }
+
+    with open(SSH_CONFIG, 'w') as f:
+        for line in preamble:
+            f.write(line)
+        for h in hosts:
+            f.write(f"\nHost {h['Host']}\n")
+            written = set()
+            for k in KEY_ORDER:
+                if k in h and k not in written:
+                    label = LABEL_MAP.get(k, k)
+                    f.write(f"    {label} {h[k]}\n")
+                    written.add(k)
+            for line in h.get('_extra', []):
+                f.write(line)
+    ok(f"Config guardado  (backup: {bak.name})")
+
+def get_host(hosts, alias):
+    for h in hosts:
+        if h['Host'].lower() == alias.lower():
+            return h
+    return None
+
+def find_host_index(hosts, alias):
+    for i, h in enumerate(hosts):
+        if h['Host'].lower() == alias.lower():
+            return i
+    return -1
+
+# ----------------------------------------------------------------
+# fzf helper
+# ----------------------------------------------------------------
+def fzf_select(items, prompt_str="", preview_cmd=None):
+    if not shutil.which('fzf'):
+        err("fzf no encontrado. Instala con: brew install fzf")
+        sys.exit(1)
+    cmd = ['fzf', f'--prompt={prompt_str}', '--height=50%', '--border',
+           '--ansi', '--tac']
+    if preview_cmd:
+        cmd += ['--preview', preview_cmd]
+    result = subprocess.run(cmd, input='\n'.join(items), text=True,
+                            capture_output=True)
+    return result.stdout.strip() or None
+
+# ----------------------------------------------------------------
+# Prompt helper
+# ----------------------------------------------------------------
+def prompt(label, default=None, required=False):
+    hint = f" [{default}]" if default else ""
+    while True:
+        val = input(f"  {label}{hint}: ").strip()
+        if not val and default is not None:
+            return default
+        if not val and required:
+            warn("  Campo obligatorio.")
+            continue
+        return val or None
+
+# ----------------------------------------------------------------
+# -add
+# ----------------------------------------------------------------
+def cmd_add(args):
+    hosts, preamble = parse_config()
+
+    if args.alias and args.host and args.user:
+        alias    = args.alias
+        hostname = args.host
+        user     = args.user
+        port     = args.port
+        key      = args.key
+        jump     = args.jump
+        jump_key = args.jump_key
+    else:
+        info("\n── Agregar nueva conexión ──────────────────────────\n")
+        alias    = prompt("Alias  (ej: ucuenca-prod-nuevo)", required=True)
+        hostname = prompt("Hostname / IP", required=True)
+        user     = prompt("Usuario", required=True)
+        port     = prompt("Puerto", default="22")
+        key      = prompt("Ruta llave .pem  (vacío si no aplica)")
+        if key:
+            key = os.path.expanduser(key)
+        jump     = prompt("Jump server  usuario@host:puerto  (vacío si no aplica)")
+        jump_key = None
+        if jump:
+            jk = prompt("  Ruta llave jump .pem  (vacío si misma llave)")
+            jump_key = os.path.expanduser(jk) if jk else None
+
+    if get_host(hosts, alias):
+        err(f"El alias '{alias}' ya existe. Usa -edit para modificarlo.")
+        sys.exit(1)
+
+    # Validate port if given
+    if port:
+        try:
+            port_int = int(port)
+            if port_int < 1 or port_int > 65535:
+                err(f"Puerto inválido: {port}")
+                sys.exit(1)
+        except ValueError:
+            err(f"Puerto no es un número: {port}")
+            sys.exit(1)
+
+    new = {'Host': alias, '_extra': [], 'hostname': hostname, 'user': user}
+    if port and port != '22':
+        new['port'] = port
+    if key:
+        new['identityfile'] = key
+    if jump:
+        if jump_key:
+            jhost, jport = (jump.rsplit(':', 1) if ':' in jump else (jump, '22'))
+            new['proxycommand'] = f"ssh -W %h:%p -i {jump_key} {jhost} -p {jport}"
+        else:
+            new['proxyjump'] = jump
+
+    # Insertar junto al mismo cliente
+    client = alias.split('-')[0].lower()
+    insert_at = len(hosts)
+    for i, h in enumerate(hosts):
+        if h['Host'] == '*':
+            continue
+        if h['Host'].lower().startswith(client):
+            insert_at = i + 1
+
+    hosts.insert(insert_at, new)
+    write_config(hosts, preamble)
+    ok(f"'{alias}'  →  {user}@{hostname}" + (f"  (jump: {jump})" if jump else ""))
+
+# ----------------------------------------------------------------
+# -list
+# ----------------------------------------------------------------
+def cmd_list(args):
+    hosts, _ = parse_config()
+    real = [h for h in hosts if h['Host'] != '*']
+
+    if not real:
+        warn("No hay hosts configurados.")
+        return
+
+    if args.plain:
+        # Non-interactive: print all hosts in a table
+        print(f"\n{'Cliente':<14} {'Alias':<42} {'User@Host':<30} {'Jump':<30}")
+        print("─" * 116)
+        for h in real:
+            jump = ''
+            if 'proxyjump' in h:
+                jump = h['proxyjump']
+            elif 'proxycommand' in h:
+                for part in h['proxycommand'].split():
+                    if '@' in part and not part.startswith('-'):
+                        jump = part
+                        break
+            client = h['Host'].split('-')[0].upper()
+            hostname = h.get('hostname', '?')
+            user = h.get('user', '?')
+            print(f"{client:<14} {h['Host']:<42} {user}@{hostname:<28} {jump}")
+        print()
+        return
+
+    # Interactive fzf mode
+    lines = []
+    for h in real:
+        jump = ''
+        if 'proxyjump' in h:
+            jump = h['proxyjump']
+        elif 'proxycommand' in h:
+            for part in h['proxycommand'].split():
+                if '@' in part and not part.startswith('-'):
+                    jump = part
+                    break
+        client = h['Host'].split('-')[0].upper()
+        col1 = h['Host']
+        col2 = f"{h.get('user','?')}@{h.get('hostname','?')}"
+        col3 = f"→ {jump}" if jump else ''
+        lines.append(f"{C.CYAN}{client:<12}{C.RESET} {col1:<45} {col2:<35} {C.DIM}{col3}{C.RESET}")
+
+    if not lines:
+        warn("No hay hosts configurados.")
+        return
+
+    # Fixed preview: column index 1 is the alias after stripping ANSI
+    preview = "echo '{}' | sed 's/^[^ ]* //' | awk '{print $1}' | xargs -I{} grep -A10 '^Host {}$' ~/.ssh/config 2>/dev/null || echo '(sin detalles)'"
+    selected = fzf_select(lines, prompt_str="Host> ", preview_cmd=preview)
+    if not selected:
+        return
+
+    # Extract alias by stripping ANSI and taking second token
+    clean = re.sub(r'\033\[[0-9;]*m', '', selected).strip()
+    parts = clean.split()
+    if len(parts) < 2:
+        err("No se pudo extraer el alias de la selección.")
+        return
+    alias = parts[1]
+    h = get_host(hosts, alias)
+    if not h:
+        err(f"No encontrado: '{alias}'")
+        return
+
+    print(f"\n{C.BOLD}  {h['Host']}{C.RESET}")
+    print(f"  HostName     {h.get('hostname','')}")
+    print(f"  User         {h.get('user','')}")
+    if 'port' in h:
+        print(f"  Port         {h['port']}")
+    if 'identityfile' in h:
+        print(f"  IdentityFile {h['identityfile']}")
+    if 'proxyjump' in h:
+        print(f"  ProxyJump    {h['proxyjump']}")
+    if 'proxycommand' in h:
+        print(f"  ProxyCommand {h['proxycommand']}")
+    if 'identitiesonly' in h:
+        print(f"  IdentitiesOnly {h['identitiesonly']}")
+    print()
+
+# ----------------------------------------------------------------
+# -connect
+# ----------------------------------------------------------------
+def cmd_connect(args):
+    hosts, _ = parse_config()
+    real = [h for h in hosts if h['Host'] != '*']
+
+    if not real:
+        warn("No hay hosts configurados.")
+        return
+
+    if args.alias:
+        alias = args.alias
+        h = get_host(hosts, alias)
+        if not h:
+            err(f"No encontrado: '{alias}'")
+            sys.exit(1)
+        print(f"\n{C.BOLD}Conectando a {alias}...{C.RESET}")
+        subprocess.run(['ssh', alias])
+    else:
+        # Interactive selection
+        names = [h['Host'] for h in real]
+        selected = fzf_select(names, prompt_str="Conectar a> ")
+        if not selected:
+            return
+        print(f"\n{C.BOLD}Conectando a {selected}...{C.RESET}")
+        subprocess.run(['ssh', selected])
+
+# ----------------------------------------------------------------
+# -show
+# ----------------------------------------------------------------
+def cmd_show(args):
+    hosts, _ = parse_config()
+
+    if args.alias:
+        alias = args.alias
+    else:
+        real = [h['Host'] for h in hosts if h['Host'] != '*']
+        if not real:
+            warn("No hay hosts configurados.")
+            return
+        alias = fzf_select(real, prompt_str="Mostrar> ")
+        if not alias:
+            return
+
+    h = get_host(hosts, alias)
+    if not h:
+        err(f"No encontrado: '{alias}'")
+        sys.exit(1)
+
+    print(f"\n{C.BOLD}  {h['Host']}{C.RESET}")
+    print(f"  HostName     {h.get('hostname','')}")
+    print(f"  User         {h.get('user','')}")
+    if 'port' in h:
+        print(f"  Port         {h['port']}")
+    if 'identityfile' in h:
+        print(f"  IdentityFile {h['identityfile']}")
+    if 'proxyjump' in h:
+        print(f"  ProxyJump    {h['proxyjump']}")
+    if 'proxycommand' in h:
+        print(f"  ProxyCommand {h['proxycommand']}")
+    if 'identitiesonly' in h:
+        print(f"  IdentitiesOnly {h['identitiesonly']}")
+    print()
+
+# ----------------------------------------------------------------
+# -test
+# ----------------------------------------------------------------
+def cmd_test(args):
+    hosts, _ = parse_config()
+
+    if args.alias:
+        alias = args.alias
+    else:
+        real = [h['Host'] for h in hosts if h['Host'] != '*']
+        if not real:
+            warn("No hay hosts configurados.")
+            return
+        alias = fzf_select(real, prompt_str="Testear> ")
+        if not alias:
+            return
+
+    h = get_host(hosts, alias)
+    if not h:
+        err(f"No encontrado: '{alias}'")
+        sys.exit(1)
+
+    print(f"\n{C.BOLD}Probando configuración para {alias}...{C.RESET}")
+    try:
+        result = subprocess.run(
+            ['ssh', '-G', alias],
+            capture_output=True, text=True, timeout=10
+        )
+        if result.returncode == 0:
+            ok("ssh -G pasó correctamente")
+            # Show resolved config
+            print()
+            for line in result.stdout.strip().split('\n'):
+                parts = line.split(None, 1)
+                if len(parts) == 2:
+                    key, val = parts
+                    if key in ('hostname', 'user', 'port', 'identityfile',
+                               'proxycommand', 'proxyjump', 'stricthostkeychecking'):
+                        print(f"  {key:<25} {val}")
+        else:
+            err("ssh -G falló:")
+            if result.stderr:
+                print(f"  {result.stderr.strip()}")
+            sys.exit(1)
+    except subprocess.TimeoutExpired:
+        err("ssh -G timeout (10s)")
+        sys.exit(1)
+    except FileNotFoundError:
+        err("ssh no encontrado en PATH")
+        sys.exit(1)
+    print()
+
+# ----------------------------------------------------------------
+# -remove
+# ----------------------------------------------------------------
+def cmd_remove(args):
+    hosts, preamble = parse_config()
+    real = [h['Host'] for h in hosts if h['Host'] != '*']
+
+    if args.alias:
+        alias = args.alias
+    else:
+        alias = fzf_select(real, prompt_str="Eliminar> ")
+
+    if not alias:
+        return
+
+    host = get_host(hosts, alias)
+    if not host:
+        err(f"No encontrado: '{alias}'")
+        sys.exit(1)
+
+    print(f"\n  {C.BOLD}{alias}{C.RESET}  →  "
+          f"{host.get('user','?')}@{host.get('hostname','?')}")
+    confirm = input("  ¿Confirmar eliminación? [s/N]: ").strip().lower()
+    if confirm != 's':
+        warn("Cancelado.")
+        return
+
+    hosts = [h for h in hosts if h['Host'] != alias]
+    write_config(hosts, preamble)
+    ok(f"'{alias}' eliminado.")
+
+# ----------------------------------------------------------------
+# -edit
+# ----------------------------------------------------------------
+def cmd_edit(args):
+    hosts, preamble = parse_config()
+    real = [h['Host'] for h in hosts if h['Host'] != '*']
+
+    if args.alias:
+        alias = args.alias
+    else:
+        alias = fzf_select(real, prompt_str="Editar> ")
+
+    if not alias:
+        return
+
+    host = get_host(hosts, alias)
+    if not host:
+        err(f"No encontrado: '{alias}'")
+        sys.exit(1)
+
+    info(f"\n── Editando: {alias} ──────────────────────────────")
+    info("  (Enter para mantener el valor actual)\n")
+
+    host['hostname'] = prompt("Hostname / IP", default=host.get('hostname')) or host['hostname']
+    host['user']     = prompt("Usuario", default=host.get('user')) or host['user']
+
+    new_port = prompt("Puerto", default=host.get('port', '22'))
+    if new_port and new_port != '22':
+        try:
+            port_int = int(new_port)
+            if port_int < 1 or port_int > 65535:
+                err(f"Puerto inválido: {new_port}")
+                sys.exit(1)
+        except ValueError:
+            err(f"Puerto no es un número: {new_port}")
+            sys.exit(1)
+        host['port'] = new_port
+    else:
+        host.pop('port', None)
+
+    new_key = prompt("Ruta llave .pem", default=host.get('identityfile', ''))
+    if new_key:
+        host['identityfile'] = os.path.expanduser(new_key)
+    elif 'identityfile' in host:
+        remove_key = input("  ¿Quitar la llave actual? [s/N]: ").strip().lower()
+        if remove_key == 's':
+            host.pop('identityfile', None)
+
+    # Edit ProxyJump/ProxyCommand
+    if 'proxyjump' in host or 'proxycommand' in host:
+        current_jump = host.get('proxyjump', '')
+        current_pc = host.get('proxycommand', '')
+        jump_display = f"{current_jump or '(proxycommand)'}"
+        if current_pc and current_pc != current_jump:
+            jump_display += f"  +  proxycommand: {current_pc[:60]}{'...' if len(current_pc) > 60 else ''}"
+        new_jump = prompt("Jump server (usuario@host:puerto / vacío para quitar)",
+                          default=jump_display if jump_display else None)
+        if new_jump and new_jump.strip():
+            # Parse the jump input
+            j_input = new_jump.strip()
+            # Check if it looks like user@host:port or user@host
+            if '@' in j_input:
+                j_user_host = j_input.split('@')[0]
+                # Check for port
+                if ':' in j_input:
+                    j_host, j_port = j_input.rsplit(':', 1)
+                else:
+                    j_host = j_input
+                    j_port = '22'
+                # Check if jump key changed
+                current_key = ''
+                if current_pc:
+                    m = re.search(r'-i\s+(\S+)', current_pc)
+                    if m:
+                        current_key = m.group(1)
+                new_key_input = prompt("  Ruta llave jump .pem  (vacío si misma llave)")
+                if new_key_input:
+                    nk = os.path.expanduser(new_key_input.strip())
+                    jh, jp = (j_host, j_port) if ':' in j_input else (j_host, '22')
+                    host['proxycommand'] = f"ssh -W %h:%p -i {nk} {jh} -p {jp}"
+                else:
+                    host['proxycommand'] = f"ssh -W %h:%p {j_user_host}@{j_host} -p {j_port}"
+                host.pop('proxyjump', None)
+        else:
+            # Remove jump
+            host.pop('proxyjump', None)
+            host.pop('proxycommand', None)
+
+    # Edit IdentitiesOnly
+    current_io = host.get('identitiesonly', '')
+    new_io = prompt("IdentitiesOnly (yes/no/vacío para quitar)",
+                    default=current_io if current_io else None)
+    if new_io and new_io.strip().lower() in ('yes', 'no'):
+        host['identitiesonly'] = new_io.strip().lower()
+    elif new_io and new_io.strip().lower() == '':
+        if 'identitiesonly' in host:
+            remove_io = input("  ¿Quitar IdentitiesOnly? [s/N]: ").strip().lower()
+            if remove_io == 's':
+                host.pop('identitiesonly', None)
+
+    write_config(hosts, preamble)
+    ok(f"'{alias}' actualizado.")
+
+# ----------------------------------------------------------------
+# Main
+# ----------------------------------------------------------------
+def main():
+    parser = argparse.ArgumentParser(
+        prog='sshman',
+        description='Gestor de conexiones SSH — PolluxData',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Ejemplos:
+  sshman -list
+  sshman -list --plain
+  sshman -connect
+  sshman -connect -alias polluxdata-sites
+  sshman -add
+  sshman -add -alias yoveri-oci-nuevo -host 172.19.1.200 -user opc
+  sshman -add -alias yoveri-oci-nuevo -host 172.19.1.200 -user opc \\
+         -key ~/.ssh/keys/YOVERI/OCI-BTA/nuevo.pem \\
+         -jump opc@149.130.180.28:22
+  sshman -remove
+  sshman -remove -alias yoveri-oci-nuevo
+  sshman -edit
+  sshman -edit -alias yoveri-oci-nuevo
+  sshman -show -alias polluxdata-sites
+  sshman -test -alias polluxdata-sites
+        """
+    )
+
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument('-add',     action='store_true')
+    mode.add_argument('-list',    action='store_true')
+    mode.add_argument('-remove',  action='store_true')
+    mode.add_argument('-edit',    action='store_true')
+    mode.add_argument('-connect', action='store_true')
+    mode.add_argument('-show',    action='store_true')
+    mode.add_argument('-test',    action='store_true')
+
+    parser.add_argument('-alias',    help='Alias del host')
+    parser.add_argument('-host',     help='Hostname o IP')
+    parser.add_argument('-user',     help='Usuario SSH')
+    parser.add_argument('-port',     help='Puerto (default: 22)')
+    parser.add_argument('-key',      help='Ruta llave .pem')
+    parser.add_argument('-jump',     help='Jump server usuario@host:puerto')
+    parser.add_argument('-jump-key', dest='jump_key', help='Llave del jump server .pem')
+    parser.add_argument('--plain',   action='store_true', help='Modo no interactivo para -list')
+
+    args = parser.parse_args()
+
+    if   args.add:     cmd_add(args)
+    elif args.list:    cmd_list(args)
+    elif args.remove:  cmd_remove(args)
+    elif args.edit:    cmd_edit(args)
+    elif args.connect: cmd_connect(args)
+    elif args.show:    cmd_show(args)
+    elif args.test:    cmd_test(args)
+
+if __name__ == '__main__':
+    main()

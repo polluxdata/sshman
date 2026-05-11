@@ -473,9 +473,11 @@ def cmd_connect(args):
 # -show
 # ----------------------------------------------------------------
 def cmd_show(args):
+    if not args.alias:
+        err("-show requiere -alias")
+        sys.exit(1)
     real = get_real_hosts()
-    alias = resolve_alias(real, args.alias, "Mostrar> ")
-    h = require_host(real, alias)
+    h = require_host(real, args.alias)
     display_host(h)
 
 # ----------------------------------------------------------------

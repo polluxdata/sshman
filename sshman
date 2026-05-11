@@ -251,6 +251,51 @@ def get_host(hosts, alias):
     return None
 
 # ----------------------------------------------------------------
+# Common helpers (extracted to avoid duplication)
+# ----------------------------------------------------------------
+def get_real_hosts():
+    """Parse config and return hosts excluding the wildcard Host *."""
+    hosts, _ = parse_config()
+    return [h for h in hosts if h['Host'] != '*']
+
+def resolve_alias(hosts, alias_arg, prompt_str):
+    """Return alias from args or fzf selection. Exits if no hosts or none selected."""
+    if not hosts:
+        warn("No hay hosts configurados.")
+        sys.exit(0)
+    if alias_arg:
+        return alias_arg
+    selected = fzf_select([h['Host'] for h in hosts], prompt_str=prompt_str)
+    if not selected:
+        sys.exit(0)
+    return selected
+
+def require_host(hosts, alias):
+    """Find host by alias; print error and exit if not found."""
+    h = get_host(hosts, alias)
+    if not h:
+        err(f"No encontrado: '{alias}'")
+        sys.exit(1)
+    return h
+
+def display_host(host):
+    """Print formatted details of a host entry."""
+    print(f"\n{C.BOLD}  {host['Host']}{C.RESET}")
+    print(f"  HostName     {host.get('hostname','')}")
+    print(f"  User         {host.get('user','')}")
+    if 'port' in host:
+        print(f"  Port         {host['port']}")
+    if 'identityfile' in host:
+        print(f"  IdentityFile {host['identityfile']}")
+    if 'proxyjump' in host:
+        print(f"  ProxyJump    {host['proxyjump']}")
+    if 'proxycommand' in host:
+        print(f"  ProxyCommand {host['proxycommand']}")
+    if 'identitiesonly' in host:
+        print(f"  IdentitiesOnly {host['identitiesonly']}")
+    print()
+
+# ----------------------------------------------------------------
 # fzf helper
 # ----------------------------------------------------------------
 def fzf_select(items, prompt_str="", preview_cmd=None):
@@ -352,8 +397,7 @@ def cmd_add(args):
 # -list
 # ----------------------------------------------------------------
 def cmd_list(args):
-    hosts, _ = parse_config()
-    real = [h for h in hosts if h['Host'] != '*']
+    real = get_real_hosts()
 
     if not real:
         warn("No hay hosts configurados.")
@@ -396,10 +440,6 @@ def cmd_list(args):
         col3 = f"→ {jump}" if jump else ''
         lines.append(f"{C.CYAN}{client:<12}{C.RESET} {col1:<45} {col2:<35} {C.DIM}{col3}{C.RESET}")
 
-    if not lines:
-        warn("No hay hosts configurados.")
-        return
-
     # Preview: fzf replaces {} with selected line. xargs uses % to avoid conflict.
     preview = "echo {} | sed 's/\\x1b\\[[0-9;]*m//g' | awk '{print $2}' | xargs -I% sh -c 'grep -A10 \"^Host %$\" ~/.ssh/config 2>/dev/null || echo \"(sin detalles)\"'"
     selected = fzf_select(lines, prompt_str="Host> ", preview_cmd=preview)
@@ -413,112 +453,38 @@ def cmd_list(args):
         err("No se pudo extraer el alias de la selección.")
         return
     alias = parts[1]
-    h = get_host(hosts, alias)
+    h = get_host(real, alias)
     if not h:
         err(f"No encontrado: '{alias}'")
         return
-
-    print(f"\n{C.BOLD}  {h['Host']}{C.RESET}")
-    print(f"  HostName     {h.get('hostname','')}")
-    print(f"  User         {h.get('user','')}")
-    if 'port' in h:
-        print(f"  Port         {h['port']}")
-    if 'identityfile' in h:
-        print(f"  IdentityFile {h['identityfile']}")
-    if 'proxyjump' in h:
-        print(f"  ProxyJump    {h['proxyjump']}")
-    if 'proxycommand' in h:
-        print(f"  ProxyCommand {h['proxycommand']}")
-    if 'identitiesonly' in h:
-        print(f"  IdentitiesOnly {h['identitiesonly']}")
-    print()
+    display_host(h)
 
 # ----------------------------------------------------------------
 # -connect
 # ----------------------------------------------------------------
 def cmd_connect(args):
-    hosts, _ = parse_config()
-    real = [h for h in hosts if h['Host'] != '*']
-
-    if not real:
-        warn("No hay hosts configurados.")
-        return
-
-    if args.alias:
-        alias = args.alias
-        h = get_host(hosts, alias)
-        if not h:
-            err(f"No encontrado: '{alias}'")
-            sys.exit(1)
-        print(f"\n{C.BOLD}Conectando a {alias}...{C.RESET}")
-        subprocess.run(['ssh', alias])
-    else:
-        # Interactive selection
-        names = [h['Host'] for h in real]
-        selected = fzf_select(names, prompt_str="Conectar a> ")
-        if not selected:
-            return
-        print(f"\n{C.BOLD}Conectando a {selected}...{C.RESET}")
-        subprocess.run(['ssh', selected])
+    real = get_real_hosts()
+    alias = resolve_alias(real, args.alias, "Conectar a> ")
+    h = require_host(real, alias)
+    print(f"\n{C.BOLD}Conectando a {alias}...{C.RESET}")
+    subprocess.run(['ssh', alias])
 
 # ----------------------------------------------------------------
 # -show
 # ----------------------------------------------------------------
 def cmd_show(args):
-    hosts, _ = parse_config()
-
-    if args.alias:
-        alias = args.alias
-    else:
-        real = [h['Host'] for h in hosts if h['Host'] != '*']
-        if not real:
-            warn("No hay hosts configurados.")
-            return
-        alias = fzf_select(real, prompt_str="Mostrar> ")
-        if not alias:
-            return
-
-    h = get_host(hosts, alias)
-    if not h:
-        err(f"No encontrado: '{alias}'")
-        sys.exit(1)
-
-    print(f"\n{C.BOLD}  {h['Host']}{C.RESET}")
-    print(f"  HostName     {h.get('hostname','')}")
-    print(f"  User         {h.get('user','')}")
-    if 'port' in h:
-        print(f"  Port         {h['port']}")
-    if 'identityfile' in h:
-        print(f"  IdentityFile {h['identityfile']}")
-    if 'proxyjump' in h:
-        print(f"  ProxyJump    {h['proxyjump']}")
-    if 'proxycommand' in h:
-        print(f"  ProxyCommand {h['proxycommand']}")
-    if 'identitiesonly' in h:
-        print(f"  IdentitiesOnly {h['identitiesonly']}")
-    print()
+    real = get_real_hosts()
+    alias = resolve_alias(real, args.alias, "Mostrar> ")
+    h = require_host(real, alias)
+    display_host(h)
 
 # ----------------------------------------------------------------
 # -test
 # ----------------------------------------------------------------
 def cmd_test(args):
-    hosts, _ = parse_config()
-
-    if args.alias:
-        alias = args.alias
-    else:
-        real = [h['Host'] for h in hosts if h['Host'] != '*']
-        if not real:
-            warn("No hay hosts configurados.")
-            return
-        alias = fzf_select(real, prompt_str="Testear> ")
-        if not alias:
-            return
-
-    h = get_host(hosts, alias)
-    if not h:
-        err(f"No encontrado: '{alias}'")
-        sys.exit(1)
+    real = get_real_hosts()
+    alias = resolve_alias(real, args.alias, "Testear> ")
+    h = require_host(real, alias)
 
     print(f"\n{C.BOLD}Probando configuración para {alias}...{C.RESET}")
     try:
@@ -555,20 +521,10 @@ def cmd_test(args):
 # ----------------------------------------------------------------
 def cmd_remove(args):
     hosts, preamble = parse_config()
-    real = [h['Host'] for h in hosts if h['Host'] != '*']
+    real = [h for h in hosts if h['Host'] != '*']
 
-    if args.alias:
-        alias = args.alias
-    else:
-        alias = fzf_select(real, prompt_str="Eliminar> ")
-
-    if not alias:
-        return
-
-    host = get_host(hosts, alias)
-    if not host:
-        err(f"No encontrado: '{alias}'")
-        sys.exit(1)
+    alias = resolve_alias(real, args.alias, "Eliminar> ")
+    host = require_host(real, alias)
 
     print(f"\n  {C.BOLD}{alias}{C.RESET}  →  "
           f"{host.get('user','?')}@{host.get('hostname','?')}")
@@ -586,20 +542,10 @@ def cmd_remove(args):
 # ----------------------------------------------------------------
 def cmd_edit(args):
     hosts, preamble = parse_config()
-    real = [h['Host'] for h in hosts if h['Host'] != '*']
+    real = [h for h in hosts if h['Host'] != '*']
 
-    if args.alias:
-        alias = args.alias
-    else:
-        alias = fzf_select(real, prompt_str="Editar> ")
-
-    if not alias:
-        return
-
-    host = get_host(hosts, alias)
-    if not host:
-        err(f"No encontrado: '{alias}'")
-        sys.exit(1)
+    alias = resolve_alias(real, args.alias, "Editar> ")
+    host = require_host(real, alias)
 
     info(f"\n── Editando: {alias} ──────────────────────────────")
     info("  (Enter para mantener el valor actual)\n")

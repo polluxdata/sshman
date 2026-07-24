@@ -57,6 +57,12 @@ BACKUP_DIR  = VAULT_DIR / "backups"
 SSH_CONFIG  = HOME / ".ssh" / "config"
 INCLUDE_LINE = f"Include {VAULT_CONF}"
 
+def _unquote(val):
+    """Strip surrounding quotes from an SSH config value."""
+    if len(val) >= 2 and val[0] in ('"', "'") and val[-1] == val[0]:
+        return val[1:-1]
+    return val
+
 # ----------------------------------------------------------------
 # Colores ANSI
 # ----------------------------------------------------------------
@@ -245,7 +251,7 @@ def parse_config():
                 m2 = re.match(r'^(\S+)\s+(.+)$', stripped)
                 if m2:
                     key = m2.group(1).lower()
-                    val = m2.group(2).strip()
+                    val = _unquote(m2.group(2).strip())
                     if key in KNOWN_SSH_OPTIONS:
                         current[key] = val
                     else:
@@ -828,7 +834,7 @@ def cmd_migrate(args):
             elif current is not None:
                 m2 = re.match(r'^(\S+)\s+(.+)$', s)
                 if m2:
-                    key, val = m2.group(1).lower(), m2.group(2).strip()
+                    key, val = m2.group(1).lower(), _unquote(m2.group(2).strip())
                     if key in KNOWN_SSH_OPTIONS:
                         current[key] = val
                     else:
@@ -842,30 +848,71 @@ def cmd_migrate(args):
         return
 
     vault_hosts, preamble = parse_config()
-    migrated = 0
+    migrated, keys_copied = 0, 0
     for h in src_hosts:
         if get_host(vault_hosts, h['Host']):
             warn(f"'{h['Host']}' ya existe en el vault, se omite.")
             continue
-        # Relocate key into the vault
+        # Relocate IdentityFile into the vault (per-host name)
         kp = h.get('identityfile')
         if kp:
-            src_key = Path(os.path.expanduser(kp))
-            if src_key.exists():
-                dst = KEYS_DIR / f"{h['Host']}{src_key.suffix or '.pem'}"
-                if not dst.exists():
-                    shutil.copy2(src_key, dst)
-                    os.chmod(dst, 0o600)
+            dst = _copy_key_to_vault(kp, h['Host'])
+            if dst:
                 h['identityfile'] = str(dst)
+                keys_copied += 1
             else:
                 warn(f"Llave no encontrada para '{h['Host']}': {kp}")
+        # Relocate ProxyCommand inline keys into the vault (original name)
+        if 'proxycommand' in h:
+            new_pc, n = _rewrite_proxycommand_keys(h['proxycommand'])
+            if n > 0:
+                h['proxycommand'] = new_pc
+                keys_copied += n
         vault_hosts.append(h)
         migrated += 1
 
     write_config(vault_hosts, preamble)
-    ok(f"Migrados {migrated} host(s) al vault.")
+    ok(f"Migrados {migrated} host(s) al vault "
+       f"({keys_copied} llave(s) copiada(s) a ~/.sshman/keys/).")
     info("Revisa ~/.ssh/config y elimina manualmente los hosts duplicados "
          "que ahora gestiona sshman (vía Include).")
+
+
+def _copy_key_to_vault(kp, alias):
+    """Copy a key into the vault as <alias><suffix> (chmod 600).
+    Returns the destination Path, or None if source missing."""
+    KEYS_DIR.mkdir(parents=True, exist_ok=True)
+    src = Path(os.path.expanduser(_unquote(str(kp))))
+    if not src.exists() or not src.is_file():
+        return None
+    suffix = src.suffix if src.suffix in ('.pem', '.key') else '.pem'
+    dst = KEYS_DIR / f"{alias}{suffix}"
+    if not dst.exists():
+        shutil.copy2(src, dst)
+    os.chmod(dst, 0o600)
+    return dst
+
+
+def _rewrite_proxycommand_keys(proxycommand_str):
+    """Find all -i <path> entries in a ProxyCommand, copy each key
+    to the vault using its original filename, and rewrite the paths.
+    Returns (new_proxycommand_str, num_keys_copied)."""
+    KEYS_DIR.mkdir(parents=True, exist_ok=True)
+    n = 0
+    def _repl(m):
+        nonlocal n
+        orig = m.group(1).strip().strip('"').strip("'")
+        src = Path(os.path.expanduser(orig))
+        if not src.exists() or not src.is_file():
+            return m.group(0)
+        dst = KEYS_DIR / src.name
+        if not dst.exists():
+            shutil.copy2(src, dst)
+            os.chmod(dst, 0o600)
+        n += 1
+        return f"-i {dst}"
+    new_pc = re.sub(r'-i\s+("[^"]+"|\'[^\']+\'|\S+)', _repl, proxycommand_str)
+    return new_pc, n
 
 # ----------------------------------------------------------------
 # export / import  (portable, encrypted with openssl by default)
@@ -1028,8 +1075,8 @@ def _relocate_keys_paths():
                 h['identityfile'] = str(candidate)
                 changed = True
         if 'proxycommand' in h and '/keys/' in h['proxycommand']:
-            new_pc = re.sub(r'-i\s+(\S+)',
-                            lambda m: f"-i {KEYS_DIR / Path(m.group(1)).name}",
+            new_pc = re.sub(r'-i\s+("[^"]+"|\'[^\']+\'|\S+)',
+                            lambda m: f"-i {KEYS_DIR / Path(m.group(1).strip('\"\'')).name}",
                             h['proxycommand'])
             if new_pc != h['proxycommand']:
                 h['proxycommand'] = new_pc
@@ -1040,6 +1087,18 @@ def _relocate_keys_paths():
 # ----------------------------------------------------------------
 # doctor
 # ----------------------------------------------------------------
+def _all_key_paths(host):
+    """Return all key file paths referenced by a host: IdentityFile plus
+    any -i <path> in ProxyCommand."""
+    paths = []
+    if 'identityfile' in host:
+        paths.append(os.path.expanduser(str(host['identityfile'])))
+    if 'proxycommand' in host:
+        for m in re.finditer(r'-i\s+("[^"]+"|\'[^\']+\'|\S+)',
+                             host['proxycommand']):
+            paths.append(os.path.expanduser(m.group(1).strip('"\'')))
+    return paths
+
 def cmd_doctor(args):
     ensure_vault()
     problems = 0
@@ -1059,31 +1118,34 @@ def cmd_doctor(args):
         if args.fix:
             ensure_include()
 
-    # 2. Vault dir perms
+    # 2. Check IdentityFile + ProxyCommand keys
     hosts = get_real_hosts()
+    checked_keys = set()
     for h in hosts:
-        kp = h.get('identityfile')
-        if not kp:
+        for kp in _all_key_paths(h):
+            if kp in checked_keys:
+                continue
+            checked_keys.add(kp)
+            p = Path(kp)
+            if not p.exists():
+                problems += 1
+                err(f"'{h['Host']}': llave no existe → {kp}")
+                continue
+            mode = oct(p.stat().st_mode & 0o777)
+            if mode != '0o600':
+                problems += 1
+                err(f"'{h['Host']}': permisos {mode} en {p.name} (deben ser 600)")
+                if args.fix:
+                    try:
+                        os.chmod(p, 0o600)
+                        ok(f"  Corregido a 600: {p.name}")
+                        problems -= 1
+                    except OSError as e:
+                        err(f"  No se pudo corregir: {e}")
+            else:
+                ok(f"'{h['Host']}': llave OK ({p.name})")
+        if not h.get('identityfile') and not h.get('proxycommand'):
             warn(f"'{h['Host']}' no tiene IdentityFile")
-            continue
-        p = Path(kp)
-        if not p.exists():
-            problems += 1
-            err(f"'{h['Host']}': llave no existe → {kp}")
-            continue
-        mode = oct(p.stat().st_mode & 0o777)
-        if mode != '0o600':
-            problems += 1
-            err(f"'{h['Host']}': permisos {mode} en {p.name} (deben ser 600)")
-            if args.fix:
-                try:
-                    os.chmod(p, 0o600)
-                    ok(f"  Corregido a 600: {p.name}")
-                    problems -= 1
-                except OSError as e:
-                    err(f"  No se pudo corregir: {e}")
-        else:
-            ok(f"'{h['Host']}': llave OK ({p.name})")
 
     print()
     if problems == 0:

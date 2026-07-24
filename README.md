@@ -122,7 +122,24 @@ sshman test acme-prod-api        # ssh -G
 sshman migrate
 ```
 
-Importa los hosts de `~/.ssh/config` al vault y copia/relocaliza sus llaves. Luego elimina manualmente de `~/.ssh/config` los hosts duplicados (ahora los gestiona el `Include`).
+Importa todos los hosts de `~/.ssh/config` al vault y copia sus llaves:
+- **IdentityFile** → `~/.sshman/keys/<alias>.pem` (renombrada por host)
+- **ProxyCommand `-i`** → `~/.sshman/keys/<nombre-original>` (compartidas entre hosts)
+
+Las llaves de bastión compartidas en `ProxyCommand` (p.ej. una misma llave usada por 30 hosts) se copian **una sola vez** con su nombre original. Las rutas se reescriben automáticamente al vault.
+
+Después de migrar, limpia `~/.ssh/config` dejando solo el `Include` (línea 1), otros `Include` (colima, etc.), el `Host *` global y comentarios. Así el vault tiene **prioridad** y no hay duplicados que causen colisiones.
+
+```bash
+# ~/.ssh/config tras migrar:
+Include ~/.sshman/config
+Include ~/.colima/ssh_config
+
+Host *
+    ServerAliveInterval 30
+    AddKeysToAgent yes
+    UseKeychain yes
+```
 
 ### Portabilidad: export / import
 

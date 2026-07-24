@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+*.pyo
+sshman-vault-*.tar.gz
+sshman-vault-*.tar.gz.enc

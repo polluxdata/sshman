@@ -250,12 +250,6 @@ def get_host(hosts, alias):
             return h
     return None
 
-def find_host_index(hosts, alias):
-    for i, h in enumerate(hosts):
-        if h['Host'].lower() == alias.lower():
-            return i
-    return -1
-
 # ----------------------------------------------------------------
 # fzf helper
 # ----------------------------------------------------------------
@@ -406,8 +400,8 @@ def cmd_list(args):
         warn("No hay hosts configurados.")
         return
 
-    # Fixed preview: column index 1 is the alias after stripping ANSI
-    preview = "echo '{}' | sed 's/^[^ ]* //' | awk '{print $1}' | xargs -I{} grep -A10 '^Host {}$' ~/.ssh/config 2>/dev/null || echo '(sin detalles)'"
+    # Preview: fzf replaces {} with selected line. xargs uses % to avoid conflict.
+    preview = "echo {} | sed 's/\\x1b\\[[0-9;]*m//g' | awk '{print $2}' | xargs -I% sh -c 'grep -A10 \"^Host %$\" ~/.ssh/config 2>/dev/null || echo \"(sin detalles)\"'"
     selected = fzf_select(lines, prompt_str="Host> ", preview_cmd=preview)
     if not selected:
         return
@@ -636,56 +630,57 @@ def cmd_edit(args):
             host.pop('identityfile', None)
 
     # Edit ProxyJump/ProxyCommand
-    if 'proxyjump' in host or 'proxycommand' in host:
-        current_jump = host.get('proxyjump', '')
-        current_pc = host.get('proxycommand', '')
-        jump_display = f"{current_jump or '(proxycommand)'}"
-        if current_pc and current_pc != current_jump:
-            jump_display += f"  +  proxycommand: {current_pc[:60]}{'...' if len(current_pc) > 60 else ''}"
-        new_jump = prompt("Jump server (usuario@host:puerto / vacío para quitar)",
-                          default=jump_display if jump_display else None)
-        if new_jump and new_jump.strip():
-            # Parse the jump input
-            j_input = new_jump.strip()
-            # Check if it looks like user@host:port or user@host
-            if '@' in j_input:
-                j_user_host = j_input.split('@')[0]
-                # Check for port
-                if ':' in j_input:
-                    j_host, j_port = j_input.rsplit(':', 1)
-                else:
-                    j_host = j_input
-                    j_port = '22'
-                # Check if jump key changed
-                current_key = ''
-                if current_pc:
-                    m = re.search(r'-i\s+(\S+)', current_pc)
-                    if m:
-                        current_key = m.group(1)
-                new_key_input = prompt("  Ruta llave jump .pem  (vacío si misma llave)")
-                if new_key_input:
-                    nk = os.path.expanduser(new_key_input.strip())
-                    jh, jp = (j_host, j_port) if ':' in j_input else (j_host, '22')
-                    host['proxycommand'] = f"ssh -W %h:%p -i {nk} {jh} -p {jp}"
-                else:
-                    host['proxycommand'] = f"ssh -W %h:%p {j_user_host}@{j_host} -p {j_port}"
-                host.pop('proxyjump', None)
-        else:
-            # Remove jump
+    current_jump = host.get('proxyjump', '')
+    current_pc = host.get('proxycommand', '')
+    has_jump = bool(current_jump or current_pc)
+
+    if has_jump:
+        jump_display = current_jump or current_pc
+        info(f"\n  Jump actual: {jump_display}")
+        new_jump = prompt("Nuevo jump (usuario@host:puerto / 'quitar' / Enter para mantener)",
+                          default=None)
+    else:
+        new_jump = prompt("Agregar jump server (usuario@host:puerto / Enter para omitir)",
+                          default=None)
+
+    if new_jump and new_jump.strip():
+        j_input = new_jump.strip()
+        if j_input.lower() == 'quitar':
             host.pop('proxyjump', None)
             host.pop('proxycommand', None)
+        elif '@' in j_input:
+            # Parse user@host:port
+            if ':' in j_input:
+                j_host_port = j_input.rsplit(':', 1)
+                j_host = j_host_port[0]
+                j_port = j_host_port[1]
+            else:
+                j_host = j_input
+                j_port = '22'
+            new_key_input = prompt("  Ruta llave jump .pem  (vacío si misma llave)")
+            if new_key_input:
+                nk = os.path.expanduser(new_key_input.strip())
+                host['proxycommand'] = f"ssh -W %h:%p -i {nk} {j_host} -p {j_port}"
+            else:
+                host['proxycommand'] = f"ssh -W %h:%p {j_host} -p {j_port}"
+            host.pop('proxyjump', None)
+        else:
+            warn("Formato de jump inválido. Use usuario@host:puerto")
 
     # Edit IdentitiesOnly
     current_io = host.get('identitiesonly', '')
-    new_io = prompt("IdentitiesOnly (yes/no/vacío para quitar)",
-                    default=current_io if current_io else None)
-    if new_io and new_io.strip().lower() in ('yes', 'no'):
-        host['identitiesonly'] = new_io.strip().lower()
-    elif new_io and new_io.strip().lower() == '':
-        if 'identitiesonly' in host:
-            remove_io = input("  ¿Quitar IdentitiesOnly? [s/N]: ").strip().lower()
-            if remove_io == 's':
-                host.pop('identitiesonly', None)
+    if current_io:
+        new_io = prompt("IdentitiesOnly (yes/no/quitar / Enter para mantener)",
+                        default=None)
+    else:
+        new_io = prompt("IdentitiesOnly (yes/no / Enter para omitir)",
+                        default=None)
+    if new_io and new_io.strip():
+        val = new_io.strip().lower()
+        if val == 'quitar':
+            host.pop('identitiesonly', None)
+        elif val in ('yes', 'no'):
+            host['identitiesonly'] = val
 
     write_config(hosts, preamble)
     ok(f"'{alias}' actualizado.")

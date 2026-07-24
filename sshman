@@ -22,9 +22,12 @@ Uso:
 import argparse
 import os
 import re
+import select
 import shutil
 import subprocess
 import sys
+import termios
+import tty
 from datetime import datetime
 from pathlib import Path
 
@@ -298,28 +301,91 @@ def display_host(host):
 # ----------------------------------------------------------------
 # Terminal background color helpers
 # ----------------------------------------------------------------
+# Cache the original background colour so we can restore it exactly.
+_original_bg_color = None
+
+
+def _query_terminal_bg():
+    """Query the terminal for its current background colour via OSC 11.
+    Returns a hex string like '#RRGGBB' or None if the query fails."""
+    if not sys.stdout.isatty():
+        return None
+
+    fd = sys.stdin.fileno()
+    try:
+        old_settings = termios.tcgetattr(fd)
+    except termios.error:
+        return None
+
+    try:
+        tty.setcbreak(fd)
+        sys.stdout.write("\033]11;?\007")
+        sys.stdout.flush()
+
+        response = ""
+        while True:
+            ready, _, _ = select.select([sys.stdin], [], [], 0.5)
+            if not ready:
+                break
+            char = sys.stdin.read(1)
+            if not char:
+                break
+            response += char
+            if char in ("\007", "\033\\"):
+                break
+
+        m = re.search(r'rgb:([0-9a-fA-F]+)/([0-9a-fA-F]+)/([0-9a-fA-F]+)', response)
+        if m:
+            r = m.group(1)[:2]
+            g = m.group(2)[:2]
+            b = m.group(3)[:2]
+            return f"#{r}{g}{b}"
+    except Exception:
+        return None
+    finally:
+        try:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+        except termios.error:
+            pass
+
+
+def get_original_bg_color():
+    """Return the cached original background colour, querying once if needed."""
+    global _original_bg_color
+    if _original_bg_color is None:
+        _original_bg_color = _query_terminal_bg()
+    return _original_bg_color
+
+
 def set_terminal_bg(color_hex):
     """Set terminal background color via OSC 11 sequence."""
     sys.stdout.write(f"\033]11;{color_hex}\007")
     sys.stdout.flush()
 
-def reset_terminal_bg():
-    """Reset terminal background to default via OSC 11 sequence."""
-    sys.stdout.write("\033]11;default\007")
+
+def restore_terminal_bg():
+    """Restore the terminal background to the colour captured at startup."""
+    original = get_original_bg_color()
+    if original:
+        sys.stdout.write(f"\033]11;{original}\007")
+    else:
+        sys.stdout.write("\033]11;default\007")
     sys.stdout.flush()
 
+
 def terminal_bg_for_alias(alias):
-    """Return a background color hex string based on the alias name."""
+    """Return a pastel background colour hex string based on the alias name.
+    Colours are intentionally light so black text remains readable."""
     a = alias.lower()
     if 'prod' in a:
-        return '#CC0000'      # Red for production
+        return '#FFB3B3'      # Light pink / red for production
     if 'test' in a or 'staging' in a or 'dr' in a:
-        return '#FF8800'      # Orange for test/staging/DR
+        return '#FFE0B3'      # Light peach / orange for test/staging/DR
     if 'dev' in a or 'lab' in a:
-        return '#008800'      # Green for dev/lab
+        return '#B3FFB3'      # Light mint / green for dev/lab
     if 'bastion' in a:
-        return '#CCCC00'      # Yellow for bastions
-    return '#0066CC'          # Blue default
+        return '#FFFFB3'      # Light yellow for bastions
+    return '#B3D9FF'          # Light sky blue default
 
 # ----------------------------------------------------------------
 # fzf helper
@@ -495,11 +561,12 @@ def cmd_connect(args):
     print(f"\n{C.BOLD}Conectando a {alias}...{C.RESET}")
 
     if sys.stdout.isatty():
+        get_original_bg_color()          # query once before we change it
         set_terminal_bg(terminal_bg_for_alias(alias))
         try:
             subprocess.run(['ssh', alias])
         finally:
-            reset_terminal_bg()
+            restore_terminal_bg()
     else:
         subprocess.run(['ssh', alias])
 

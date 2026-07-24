@@ -8,8 +8,10 @@ Gestor de conexiones SSH interactivo con `fzf`. Diseñado para administrar de fo
 
 - **Listado interactivo** con `fzf` y preview del host seleccionado
 - **Conexión directa** desde el selector sin necesidad de escribir el alias
+- **Cambio de color de terminal** al conectar según el entorno (prod=rojo, test=naranja, dev=verde)
 - **Agregar hosts** con validación de puertos y soporte para jump servers
 - **Editar hosts** incluyendo `ProxyCommand`, `ProxyJump`, `IdentitiesOnly`, etc.
+- **Renombrar hosts** sin editar manualmente el `~/.ssh/config`
 - **Eliminar hosts** con confirmación interactiva
 - **Validación** con `ssh -G` para verificar que la configuración es correcta
 - **Modo plano** (`--plain`) para listar hosts en formato tabla (ideal para scripts)
@@ -73,6 +75,15 @@ Directo por alias:
 sshman -connect -alias polluxdata-sites
 ```
 
+**Color de terminal**: Al conectar, el fondo del terminal cambia según el entorno:
+- `prod` → Rojo pastel
+- `test`/`staging`/`dr` → Naranja pastel
+- `dev`/`lab` → Verde pastel
+- `bastion` → Amarillo pastel
+- Otros → Azul pastel
+
+El color se restaura automáticamente al salir de SSH.
+
 ### Agregar un host
 
 Interactivo:
@@ -107,6 +118,13 @@ Permite modificar:
 - Jump server (`ProxyCommand` / `ProxyJump`)
 - `IdentitiesOnly`
 
+### Renombrar un host
+
+```bash
+sshman -rename
+sshman -rename -alias ucuenca-prod-nuevo -new-alias ucuenca-prod-viejo
+```
+
 ### Eliminar un host
 
 ```bash
@@ -138,6 +156,7 @@ sshman -test -alias polluxdata-sites
 | `-connect`   | Conectar a un host (interactivo o directo)     |
 | `-add`       | Agregar un nuevo host                          |
 | `-edit`      | Editar un host existente                       |
+| `-rename`    | Renombrar el alias de un host                  |
 | `-remove`    | Eliminar un host                               |
 | `-show`      | Mostrar detalles de un host                    |
 | `-test`      | Validar configuración con `ssh -G`             |
@@ -147,6 +166,7 @@ sshman -test -alias polluxdata-sites
 | Flag         | Descripción                                    |
 |--------------|------------------------------------------------|
 | `-alias`     | Alias del host                                 |
+| `-new-alias` | Nuevo alias (para `-rename`)                   |
 | `-host`      | Hostname o IP                                  |
 | `-user`      | Usuario SSH                                    |
 | `-port`      | Puerto (default: 22)                           |

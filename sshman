@@ -1,39 +1,61 @@
 #!/usr/bin/env python3
 """
-sshman — Gestor de conexiones SSH
+sshman — Gestor de conexiones SSH portable
 PolluxData / Jota
 
-Uso:
-  sshman -list
-  sshman -list --plain
-  sshman -connect
-  sshman -connect -alias polluxdata-sites
-  sshman -add
-  sshman -add -alias ucuenca-prod-nuevo -host 172.30.1.1 -user opc
-  sshman -add -alias ucuenca-prod-nuevo -host 172.30.1.1 -user opc -key ~/.ssh/keys/UCUENCA/PROD/nuevo.pem -jump opc@129.213.100.82:22
-  sshman -remove
-  sshman -remove -alias ucuenca-prod-nuevo
-  sshman -edit
-  sshman -edit -alias ucuenca-prod-nuevo
-  sshman -show -alias polluxdata-sites
-  sshman -test -alias polluxdata-sites
-  sshman -rename -alias ucuenca-prod-nuevo -new-alias ucuenca-prod-viejo
+Todo vive en un "vault" autocontenido y portable:
+
+  ~/.sshman/
+  ├── config        SSH config gestionado por sshman
+  ├── keys/         llaves privadas (chmod 600)
+  ├── meta.json     metadata por host (env / color)
+  └── backups/      backups con timestamp
+
+sshman garantiza que ~/.ssh/config incluya, al inicio:
+
+  Include ~/.sshman/config
+
+Comandos:
+  sshman list [--plain]
+  sshman connect [ALIAS]        (o simplemente: sshman ALIAS)
+  sshman add [--key RUTA] [--alias A --host H --user U ...]
+  sshman edit [ALIAS]
+  sshman rename [ALIAS] [NUEVO]
+  sshman remove [ALIAS]
+  sshman show ALIAS
+  sshman test [ALIAS]
+  sshman migrate                importa hosts de ~/.ssh/config al vault
+  sshman export [-o FILE] [--no-encrypt]
+  sshman import FILE
+  sshman doctor [--fix]
 """
 
 import argparse
+import getpass
+import json
 import os
 import re
 import select
 import shutil
 import subprocess
 import sys
+import tarfile
 import termios
 import tty
 from datetime import datetime
 from pathlib import Path
 
-SSH_CONFIG = Path.home() / ".ssh" / "config"
-BACKUP_DIR = Path.home() / ".ssh" / "backups"
+# ----------------------------------------------------------------
+# Rutas del vault
+# ----------------------------------------------------------------
+HOME        = Path.home()
+VAULT_DIR   = HOME / ".sshman"
+VAULT_CONF  = VAULT_DIR / "config"
+KEYS_DIR    = VAULT_DIR / "keys"
+META_FILE   = VAULT_DIR / "meta.json"
+BACKUP_DIR  = VAULT_DIR / "backups"
+SSH_CONFIG  = HOME / ".ssh" / "config"
+INCLUDE_LINE = f"Include {VAULT_CONF}"
 
 # ----------------------------------------------------------------
 # Colores ANSI
@@ -53,59 +75,161 @@ def warn(msg): print(f"{C.YELLOW}[WARN]{C.RESET} {msg}")
 def info(msg): print(f"{C.CYAN}{msg}{C.RESET}")
 
 # ----------------------------------------------------------------
+# Vault init & Include
+# ----------------------------------------------------------------
+def ensure_vault():
+    """Create the vault directory structure and the Include line if missing."""
+    VAULT_DIR.mkdir(parents=True, exist_ok=True)
+    KEYS_DIR.mkdir(parents=True, exist_ok=True)
+    BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        os.chmod(VAULT_DIR, 0o700)
+        os.chmod(KEYS_DIR, 0o700)
+    except OSError:
+        pass
+    if not VAULT_CONF.exists():
+        VAULT_CONF.write_text("")
+    if not META_FILE.exists():
+        META_FILE.write_text(json.dumps(default_meta(), indent=2) + "\n")
+    ensure_include()
+
+def ensure_include():
+    """Guarantee that ~/.ssh/config includes the vault config, at the top,
+    without duplicating the line."""
+    SSH_CONFIG.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        os.chmod(SSH_CONFIG.parent, 0o700)
+    except OSError:
+        pass
+
+    existing = SSH_CONFIG.read_text() if SSH_CONFIG.exists() else ""
+    lines = []
+    for line in existing.splitlines(keepends=True):
+        s = line.strip()
+        if s.lower().startswith("include") and str(VAULT_CONF) in s:
+            continue
+        lines.append(line)
+    header = f"{INCLUDE_LINE}\n\n"
+    new_content = header + "".join(lines)
+    if new_content != existing:
+        SSH_CONFIG.write_text(new_content)
+        ok(f"Include agregado a {SSH_CONFIG}")
+
+# ----------------------------------------------------------------
 # Backup
 # ----------------------------------------------------------------
 def backup_config():
     BACKUP_DIR.mkdir(parents=True, exist_ok=True)
-    ts  = datetime.now().strftime("%Y%m%d_%H%M%S")
+    ts  = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     dst = BACKUP_DIR / f"config.bak.{ts}"
-    shutil.copy2(SSH_CONFIG, dst)
+    if VAULT_CONF.exists():
+        shutil.copy2(VAULT_CONF, dst)
     return dst
 
 # ----------------------------------------------------------------
-# Parser del ~/.ssh/config
+# meta.json (env / color)
+# ----------------------------------------------------------------
+def default_meta():
+    return {
+        "color_rules": {
+            "prod":    "#FFB3B3",
+            "test":    "#FFE0B3",
+            "staging": "#FFE0B3",
+            "dr":      "#FFE0B3",
+            "dev":     "#B3FFB3",
+            "lab":     "#B3FFB3",
+            "bastion": "#FFFFB3",
+        },
+        "default_color": "#B3D9FF",
+        "hosts": {}
+    }
+
+def load_meta():
+    if not META_FILE.exists():
+        return default_meta()
+    try:
+        data = json.loads(META_FILE.read_text())
+    except (json.JSONDecodeError, OSError):
+        warn("meta.json ilegible, usando valores por defecto.")
+        return default_meta()
+    base = default_meta()
+    base.update({k: v for k, v in data.items() if k in base})
+    base.setdefault("hosts", {})
+    return base
+
+def save_meta(meta):
+    META_FILE.write_text(json.dumps(meta, indent=2) + "\n")
+
+def color_for_alias(alias):
+    """Resolve background colour from meta.json: explicit host color >
+    host env rule > default. No fragile substring matching on the alias."""
+    meta = load_meta()
+    entry = meta["hosts"].get(alias, {})
+    if entry.get("color"):
+        return entry["color"]
+    env = entry.get("env")
+    if env and env in meta["color_rules"]:
+        return meta["color_rules"][env]
+    return meta["default_color"]
+
+# ----------------------------------------------------------------
+# Parser del vault config
 # ----------------------------------------------------------------
 KNOWN_SSH_OPTIONS = frozenset([
     'hostname', 'user', 'port', 'identityfile', 'proxycommand',
     'proxyjump', 'identitiesonly', 'forwardagent', 'loglevel',
-    'compression', 'clearallforwardings', 'exitonforwardfailure',
-    'checkhostip', 'addressfamily', 'verifyhostkeydns',
-    'strichosts', 'globalknownhostsfile', 'kbdinteractiveauthentication',
-    'kbdinteractivedevices', 'pubkeyauthentication',
-    'authenticationmethods', 'askpassprogram', 'canonicalizehostname',
-    'canonicalizefallbacklocal', 'canonicalizepermittedcnames',
-    'canonicalizemaxdots', 'certificatefile', 'channeltimeout',
-    'casigneralgorithms', 'compressionlevel', 'connectionattempts',
-    'serveraliveinterval', 'serveralivecountmax', 'autosendkey',
-    'identities', 'ipqos', 'escapechar', 'macs', 'ciphers',
-    'kexalgorithms', 'hostkeyalgorithms', 'gssapiauthentication',
-    'gssapidelegatecredentials', 'gssapikeyexchange',
-    'gssapirenewalforcesearch', 'gssapirenewalthreshold',
-    'gssapichallenge', 'hostbasedauthentication', 'hostkeyalias',
-    'enablesshkeysign', 'sshkeysign', 'logintimeout', 'authlogindelay',
-    'batchmode', 'bindaddress', 'bindinterface', 'controlmaster',
-    'controlpath', 'controlpersist', 'connectionbindto',
-    'disableforwardings', 'hashknownhosts', 'identitiesfile',
-    'ignoreunknown', 'include', 'issuercertificatefile', 'markhosts',
-    'nohostauthenticationforlocalhost', 'numberofpasswordprompts',
-    'passwordauthentication', 'pkcs11provider',
-    'pubkeyacceptedalgorithms', 'pubkeyacceptedkeytypes',
-    'requesttty', 'runforwardings', 'sendsig',
-    'streamlocalbindmask', 'streamlocalbindunlink',
-    'syslogfacility', 'tcpkeepalive', 'teratermagent',
-    'tunnel', 'tunneldevice', 'visualhostkey', 'xauthlocation',
+    'compression', 'stricthostkeychecking', 'serveraliveinterval',
+    'serveralivecountmax', 'pubkeyauthentication', 'passwordauthentication',
+    'batchmode', 'hashknownhosts', 'connecttimeout', 'requesttty',
+    'controlmaster', 'controlpath', 'controlpersist', 'tcpkeepalive',
+    'preferredauthentications', 'addkeystoagent', 'usekeychain',
 ])
 
+LABEL_MAP = {
+    'hostname':              'HostName',
+    'user':                  'User',
+    'port':                  'Port',
+    'identityfile':          'IdentityFile',
+    'proxyjump':             'ProxyJump',
+    'proxycommand':          'ProxyCommand',
+    'identitiesonly':        'IdentitiesOnly',
+    'forwardagent':          'ForwardAgent',
+    'serveraliveinterval':   'ServerAliveInterval',
+    'serveralivecountmax':   'ServerAliveCountMax',
+    'loglevel':              'LogLevel',
+    'compression':           'Compression',
+    'stricthostkeychecking': 'StrictHostKeyChecking',
+    'pubkeyauthentication':  'PubkeyAuthentication',
+    'passwordauthentication':'PasswordAuthentication',
+    'batchmode':             'BatchMode',
+    'hashknownhosts':        'HashKnownHosts',
+    'connecttimeout':        'ConnectTimeout',
+    'requesttty':            'RequestTTY',
+    'controlmaster':         'ControlMaster',
+    'controlpath':           'ControlPath',
+    'controlpersist':        'ControlPersist',
+    'tcpkeepalive':          'TCPKeepAlive',
+    'preferredauthentications': 'PreferredAuthentications',
+    'addkeystoagent':        'AddKeysToAgent',
+    'usekeychain':           'UseKeychain',
+}
+
+KEY_ORDER = [
+    'hostname', 'user', 'port', 'identityfile',
+    'proxyjump', 'proxycommand',
+    'identitiesonly', 'forwardagent',
+    'serveraliveinterval', 'serveralivecountmax',
+    'loglevel', 'compression', 'stricthostkeychecking',
+    'pubkeyauthentication', 'passwordauthentication',
+    'batchmode', 'hashknownhosts', 'connecttimeout',
+]
+
 def parse_config():
-    """Parse ~/.ssh/config preserving all options and line structure."""
-    hosts    = []
-    current  = None
-    preamble = []
-
-    if not SSH_CONFIG.exists():
+    """Parse the vault config preserving unknown options in _extra."""
+    hosts, current, preamble = [], None, []
+    if not VAULT_CONF.exists():
         return [], []
-
-    with open(SSH_CONFIG) as f:
+    with open(VAULT_CONF) as f:
         for line in f:
             stripped = line.strip()
             if not stripped or stripped.startswith('#'):
@@ -130,110 +254,11 @@ def parse_config():
                     current['_extra'].append(line)
         if current:
             hosts.append(current)
-
     return hosts, preamble
 
 def write_config(hosts, preamble):
-    """Write ~/.ssh/config preserving known options in standard order
-    and dumping unknown/extra options as-is."""
     bak = backup_config()
-    KEY_ORDER = [
-        'hostname', 'user', 'port', 'identityfile',
-        'proxyjump', 'proxycommand',
-        'identitiesonly', 'forwardagent', 'serveraliveinterval',
-        'serveralivecountmax', 'loglevel', 'compression',
-        'pubkeyauthentication', 'passwordauthentication',
-        'batchmode', 'hashknownhosts', 'streamlocalbindunlink',
-    ]
-    LABEL_MAP = {
-        'hostname':       'HostName',
-        'user':           'User',
-        'port':           'Port',
-        'identityfile':   'IdentityFile',
-        'proxyjump':      'ProxyJump',
-        'proxycommand':   'ProxyCommand',
-        'identitiesonly': 'IdentitiesOnly',
-        'forwardagent':   'ForwardAgent',
-        'serveraliveinterval': 'ServerAliveInterval',
-        'serveralivecountmax': 'ServerAliveCountMax',
-        'loglevel':       'LogLevel',
-        'compression':    'Compression',
-        'pubkeyauthentication': 'PubkeyAuthentication',
-        'passwordauthentication': 'PasswordAuthentication',
-        'batchmode':      'BatchMode',
-        'hashknownhosts': 'HashKnownHosts',
-        'streamlocalbindunlink': 'StreamLocalBindUnlink',
-        'addressfamily':  'AddressFamily',
-        'checkhostip':    'CheckHostIP',
-        'clearallforwardings': 'ClearAllForwardings',
-        'exitonforwardfailure': 'ExitOnForwardFailure',
-        'verifyhostkeydns': 'VerifyHostKeyDNS',
-        'strichosts':     'StrictHosts',
-        'globalknownhostsfile': 'GlobalKnownHostsFile',
-        'kbdinteractiveauthentication': 'KbdInteractiveAuthentication',
-        'kbdinteractivedevices': 'KbdInteractiveDevices',
-        'authenticationmethods': 'AuthenticationMethods',
-        'askpassprogram': 'AskPassProgram',
-        'canonicalizehostname': 'CanonicalizeHostname',
-        'canonicalizefallbacklocal': 'CanonicalizeFallbackLocal',
-        'canonicalizepermittedcnames': 'CanonicalizePermittedCNAMEs',
-        'canonicalizemaxdots': 'CanonicalizeMaxDots',
-        'certificatefile': 'CertificateFile',
-        'channeltimeout': 'ChannelTimeout',
-        'casigneralgorithms': 'CASignatureAlgorithms',
-        'compressionlevel': 'CompressionLevel',
-        'connectionattempts': 'ConnectionAttempts',
-        'autosendkey':    'AutoSendKey',
-        'identities':     'Identities',
-        'ipqos':          'IPQoS',
-        'escapechar':     'EscapeChar',
-        'macs':           'MACs',
-        'ciphers':        'Ciphers',
-        'kexalgorithms':  'KexAlgorithms',
-        'hostkeyalgorithms': 'HostKeyAlgorithms',
-        'gssapiauthentication': 'GSSAPIAuthentication',
-        'gssapidelegatecredentials': 'GSSAPIDelegateCredentials',
-        'gssapikeyexchange': 'GSSAPIKeyExchange',
-        'gssapirenewalforcesearch': 'GSSAPIRenewalForceRealm',
-        'gssapirenewalthreshold': 'GSSAPIRenewalThreshold',
-        'gssapichallenge': 'GSSAPIChallenge',
-        'hostbasedauthentication': 'HostbasedAuthentication',
-        'hostkeyalias':   'HostkeyAlias',
-        'enablesshkeysign': 'EnableSSHKeySign',
-        'sshkeysign':     'SSHKeySign',
-        'logintimeout':   'LoginTimeout',
-        'authlogindelay': 'AuthLogDelay',
-        'bindaddress':    'BindAddress',
-        'bindinterface':  'BindInterface',
-        'controlmaster':  'ControlMaster',
-        'controlpath':    'ControlPath',
-        'controlpersist': 'ControlPersist',
-        'connectionbindto': 'ConnectionBindTo',
-        'disableforwardings': 'DisableForwardings',
-        'identitiesfile': 'IdentitiesFile',
-        'ignoreunknown':  'IgnoreUnknown',
-        'include':        'Include',
-        'issuercertificatefile': 'IssuerCertificateFile',
-        'markhosts':      'MarkHosts',
-        'nohostauthenticationforlocalhost': 'NoHostAuthenticationForLocalhost',
-        'numberofpasswordprompts': 'NumberOfPasswordPrompts',
-        'pkcs11provider': 'PKCS11Provider',
-        'pubkeyacceptedalgorithms': 'PubkeyAcceptedAlgorithms',
-        'pubkeyacceptedkeytypes': 'PubkeyAcceptedKeyTypes',
-        'requesttty':     'RequestTTY',
-        'runforwardings': 'RunForwards',
-        'sendsig':        'SendSig',
-        'streamlocalbindmask': 'StreamLocalBindMask',
-        'syslogfacility': 'SyslogFacility',
-        'tcpkeepalive':   'TCPKeepAlive',
-        'teratermagent':  'TeraTermAgent',
-        'tunnel':         'Tunnel',
-        'tunneldevice':   'TunnelDevice',
-        'visualhostkey':  'VisualHostKey',
-        'xauthlocation':  'XAuthLocation',
-    }
-
-    with open(SSH_CONFIG, 'w') as f:
+    with open(VAULT_CONF, 'w') as f:
         for line in preamble:
             f.write(line)
         for h in hosts:
@@ -241,8 +266,7 @@ def write_config(hosts, preamble):
             written = set()
             for k in KEY_ORDER:
                 if k in h and k not in written:
-                    label = LABEL_MAP.get(k, k)
-                    f.write(f"    {label} {h[k]}\n")
+                    f.write(f"    {LABEL_MAP.get(k, k)} {h[k]}\n")
                     written.add(k)
             for line in h.get('_extra', []):
                 f.write(line)
@@ -255,17 +279,21 @@ def get_host(hosts, alias):
     return None
 
 # ----------------------------------------------------------------
-# Common helpers (extracted to avoid duplication)
+# Helpers comunes
 # ----------------------------------------------------------------
 def get_real_hosts():
-    """Parse config and return hosts excluding the wildcard Host *."""
     hosts, _ = parse_config()
     return [h for h in hosts if h['Host'] != '*']
 
+def suggest_aliases(hosts, alias):
+    """Return up to 3 aliases that resemble the given (typo) alias."""
+    import difflib
+    names = [h['Host'] for h in hosts]
+    return difflib.get_close_matches(alias, names, n=3, cutoff=0.4)
+
 def resolve_alias(hosts, alias_arg, prompt_str):
-    """Return alias from args or fzf selection. Exits if no hosts or none selected."""
     if not hosts:
-        warn("No hay hosts configurados.")
+        warn("No hay hosts configurados. Usa: sshman add")
         sys.exit(0)
     if alias_arg:
         return alias_arg
@@ -275,15 +303,18 @@ def resolve_alias(hosts, alias_arg, prompt_str):
     return selected
 
 def require_host(hosts, alias):
-    """Find host by alias; print error and exit if not found."""
     h = get_host(hosts, alias)
     if not h:
         err(f"No encontrado: '{alias}'")
+        matches = suggest_aliases(hosts, alias)
+        if matches:
+            print(f"  ¿Quisiste decir? {', '.join(matches)}")
+        else:
+            print("  Usa 'sshman list' para ver los hosts disponibles.")
         sys.exit(1)
     return h
 
 def display_host(host):
-    """Print formatted details of a host entry."""
     print(f"\n{C.BOLD}  {host['Host']}{C.RESET}")
     print(f"  HostName     {host.get('hostname','')}")
     print(f"  User         {host.get('user','')}")
@@ -297,32 +328,65 @@ def display_host(host):
         print(f"  ProxyCommand {host['proxycommand']}")
     if 'identitiesonly' in host:
         print(f"  IdentitiesOnly {host['identitiesonly']}")
+    meta = load_meta()["hosts"].get(host['Host'], {})
+    if meta.get('env'):
+        print(f"  Env          {meta['env']}")
     print()
 
+def jump_of(host):
+    """Return a display string for the jump server of a host, or ''."""
+    if 'proxyjump' in host:
+        return host['proxyjump']
+    if 'proxycommand' in host:
+        for part in host['proxycommand'].split():
+            if '@' in part and not part.startswith('-'):
+                return part
+    return ''
+
 # ----------------------------------------------------------------
-# Terminal background color helpers
+# Gestión de llaves
 # ----------------------------------------------------------------
-# Cache the original background colour so we can restore it exactly.
+def install_key(src_path, alias):
+    """Copy a downloaded key into the vault (chmod 600) and return the
+    portable path. Warns the user to delete the original."""
+    src = Path(os.path.expanduser(src_path))
+    if not src.exists():
+        err(f"Llave no encontrada: {src}")
+        sys.exit(1)
+    if not src.is_file():
+        err(f"No es un archivo: {src}")
+        sys.exit(1)
+    KEYS_DIR.mkdir(parents=True, exist_ok=True)
+    suffix = src.suffix if src.suffix in ('.pem', '.key') else '.pem'
+    dst = KEYS_DIR / f"{alias}{suffix}"
+    if dst.exists():
+        resp = input(f"  Ya existe {dst.name}. ¿Sobrescribir? [s/N]: ").strip().lower()
+        if resp not in ('s', 'si', 'sí'):
+            warn("Cancelado.")
+            sys.exit(0)
+    shutil.copy2(src, dst)
+    os.chmod(dst, 0o600)
+    ok(f"Llave copiada a {dst}")
+    warn(f"Recuerda borrar la copia original: {src}")
+    return str(dst)
+
+# ----------------------------------------------------------------
+# Terminal background color (OSC 11)
+# ----------------------------------------------------------------
 _original_bg_color = None
 
-
 def _query_terminal_bg():
-    """Query the terminal for its current background colour via OSC 11.
-    Returns a hex string like '#RRGGBB' or None if the query fails."""
     if not sys.stdout.isatty():
         return None
-
     fd = sys.stdin.fileno()
     try:
         old_settings = termios.tcgetattr(fd)
     except termios.error:
         return None
-
     try:
         tty.setcbreak(fd)
         sys.stdout.write("\033]11;?\007")
         sys.stdout.flush()
-
         response = ""
         while True:
             ready, _, _ = select.select([sys.stdin], [], [], 0.5)
@@ -334,13 +398,9 @@ def _query_terminal_bg():
             response += char
             if char in ("\007", "\033\\"):
                 break
-
         m = re.search(r'rgb:([0-9a-fA-F]+)/([0-9a-fA-F]+)/([0-9a-fA-F]+)', response)
         if m:
-            r = m.group(1)[:2]
-            g = m.group(2)[:2]
-            b = m.group(3)[:2]
-            return f"#{r}{g}{b}"
+            return f"#{m.group(1)[:2]}{m.group(2)[:2]}{m.group(3)[:2]}"
     except Exception:
         return None
     finally:
@@ -349,47 +409,23 @@ def _query_terminal_bg():
         except termios.error:
             pass
 
-
 def get_original_bg_color():
-    """Return the cached original background colour, querying once if needed."""
     global _original_bg_color
     if _original_bg_color is None:
         _original_bg_color = _query_terminal_bg()
     return _original_bg_color
 
-
 def set_terminal_bg(color_hex):
-    """Set terminal background color via OSC 11 sequence."""
     sys.stdout.write(f"\033]11;{color_hex}\007")
     sys.stdout.flush()
 
-
 def restore_terminal_bg():
-    """Restore the terminal background to the colour captured at startup."""
     original = get_original_bg_color()
-    if original:
-        sys.stdout.write(f"\033]11;{original}\007")
-    else:
-        sys.stdout.write("\033]11;default\007")
+    sys.stdout.write(f"\033]11;{original}\007" if original else "\033]11;default\007")
     sys.stdout.flush()
 
-
-def terminal_bg_for_alias(alias):
-    """Return a pastel background colour hex string based on the alias name.
-    Colours are intentionally light so black text remains readable."""
-    a = alias.lower()
-    if 'prod' in a:
-        return '#FFB3B3'      # Light pink / red for production
-    if 'test' in a or 'staging' in a or 'dr' in a:
-        return '#FFE0B3'      # Light peach / orange for test/staging/DR
-    if 'dev' in a or 'lab' in a:
-        return '#B3FFB3'      # Light mint / green for dev/lab
-    if 'bastion' in a:
-        return '#FFFFB3'      # Light yellow for bastions
-    return '#B3D9FF'          # Light sky blue default
-
 # ----------------------------------------------------------------
-# fzf helper
+# fzf + prompt
 # ----------------------------------------------------------------
 def fzf_select(items, prompt_str="", preview_cmd=None):
     if not shutil.which('fzf'):
@@ -403,9 +439,6 @@ def fzf_select(items, prompt_str="", preview_cmd=None):
                             capture_output=True)
     return result.stdout.strip() or None
 
-# ----------------------------------------------------------------
-# Prompt helper
-# ----------------------------------------------------------------
 def prompt(label, default=None, required=False):
     hint = f" [{default}]" if default else ""
     while True:
@@ -417,153 +450,43 @@ def prompt(label, default=None, required=False):
             continue
         return val or None
 
-# ----------------------------------------------------------------
-# -add
-# ----------------------------------------------------------------
-def cmd_add(args):
-    hosts, preamble = parse_config()
+def confirm(label):
+    return input(f"  {label} [s/N]: ").strip().lower() in ('s', 'si', 'sí')
 
-    if args.alias and args.host and args.user:
-        alias    = args.alias
-        hostname = args.host
-        user     = args.user
-        port     = args.port
-        key      = args.key
-        jump     = args.jump
-        jump_key = args.jump_key
+def valid_port(port):
+    try:
+        p = int(port)
+        return 1 <= p <= 65535
+    except (ValueError, TypeError):
+        return False
+
+def build_jump(jump, jump_key):
+    """Build proxyjump/proxycommand dict fragment from a 'user@host:port'
+    string. Returns (key, value) or (None, None) if invalid."""
+    if '@' not in jump:
+        return None, None
+    if ':' in jump:
+        jhost, jport = jump.rsplit(':', 1)
     else:
-        info("\n── Agregar nueva conexión ──────────────────────────\n")
-        alias    = prompt("Alias  (ej: ucuenca-prod-nuevo)", required=True)
-        hostname = prompt("Hostname / IP", required=True)
-        user     = prompt("Usuario", required=True)
-        port     = prompt("Puerto", default="22")
-        key      = prompt("Ruta llave .pem  (vacío si no aplica)")
-        if key:
-            key = os.path.expanduser(key)
-        jump     = prompt("Jump server  usuario@host:puerto  (vacío si no aplica)")
-        jump_key = None
-        if jump:
-            jk = prompt("  Ruta llave jump .pem  (vacío si misma llave)")
-            jump_key = os.path.expanduser(jk) if jk else None
-
-    if get_host(hosts, alias):
-        err(f"El alias '{alias}' ya existe. Usa -edit para modificarlo.")
-        sys.exit(1)
-
-    # Validate port if given
-    if port:
-        try:
-            port_int = int(port)
-            if port_int < 1 or port_int > 65535:
-                err(f"Puerto inválido: {port}")
-                sys.exit(1)
-        except ValueError:
-            err(f"Puerto no es un número: {port}")
-            sys.exit(1)
-
-    new = {'Host': alias, '_extra': [], 'hostname': hostname, 'user': user}
-    if port and port != '22':
-        new['port'] = port
-    if key:
-        new['identityfile'] = key
-    if jump:
-        if jump_key:
-            jhost, jport = (jump.rsplit(':', 1) if ':' in jump else (jump, '22'))
-            new['proxycommand'] = f"ssh -W %h:%p -i {jump_key} {jhost} -p {jport}"
-        else:
-            new['proxyjump'] = jump
-
-    # Insertar junto al mismo cliente
-    client = alias.split('-')[0].lower()
-    insert_at = len(hosts)
-    for i, h in enumerate(hosts):
-        if h['Host'] == '*':
-            continue
-        if h['Host'].lower().startswith(client):
-            insert_at = i + 1
-
-    hosts.insert(insert_at, new)
-    write_config(hosts, preamble)
-    ok(f"'{alias}'  →  {user}@{hostname}" + (f"  (jump: {jump})" if jump else ""))
+        jhost, jport = jump, '22'
+    if not valid_port(jport):
+        return None, None
+    if jump_key:
+        jk = os.path.expanduser(jump_key)
+        return 'proxycommand', f"ssh -W %h:%p -i {jk} {jhost} -p {jport}"
+    return 'proxyjump', jump
 
 # ----------------------------------------------------------------
-# -list
-# ----------------------------------------------------------------
-def cmd_list(args):
-    real = get_real_hosts()
-
-    if not real:
-        warn("No hay hosts configurados.")
-        return
-
-    if args.plain:
-        # Non-interactive: print all hosts in a table
-        print(f"\n{'Cliente':<14} {'Alias':<42} {'User@Host':<30} {'Jump':<30}")
-        print("─" * 116)
-        for h in real:
-            jump = ''
-            if 'proxyjump' in h:
-                jump = h['proxyjump']
-            elif 'proxycommand' in h:
-                for part in h['proxycommand'].split():
-                    if '@' in part and not part.startswith('-'):
-                        jump = part
-                        break
-            client = h['Host'].split('-')[0].upper()
-            hostname = h.get('hostname', '?')
-            user = h.get('user', '?')
-            print(f"{client:<14} {h['Host']:<42} {user}@{hostname:<28} {jump}")
-        print()
-        return
-
-    # Interactive fzf mode
-    lines = []
-    for h in real:
-        jump = ''
-        if 'proxyjump' in h:
-            jump = h['proxyjump']
-        elif 'proxycommand' in h:
-            for part in h['proxycommand'].split():
-                if '@' in part and not part.startswith('-'):
-                    jump = part
-                    break
-        client = h['Host'].split('-')[0].upper()
-        col1 = h['Host']
-        col2 = f"{h.get('user','?')}@{h.get('hostname','?')}"
-        col3 = f"→ {jump}" if jump else ''
-        lines.append(f"{C.CYAN}{client:<12}{C.RESET} {col1:<45} {col2:<35} {C.DIM}{col3}{C.RESET}")
-
-    # Preview: fzf replaces {} with selected line. xargs uses % to avoid conflict.
-    preview = "echo {} | sed 's/\\x1b\\[[0-9;]*m//g' | awk '{print $2}' | xargs -I% sh -c 'grep -A10 \"^Host %$\" ~/.ssh/config 2>/dev/null || echo \"(sin detalles)\"'"
-    selected = fzf_select(lines, prompt_str="Host> ", preview_cmd=preview)
-    if not selected:
-        return
-
-    # Extract alias by stripping ANSI and taking second token
-    clean = re.sub(r'\033\[[0-9;]*m', '', selected).strip()
-    parts = clean.split()
-    if len(parts) < 2:
-        err("No se pudo extraer el alias de la selección.")
-        return
-    alias = parts[1]
-    h = get_host(real, alias)
-    if not h:
-        err(f"No encontrado: '{alias}'")
-        return
-    display_host(h)
-
-# ----------------------------------------------------------------
-# -connect
+# connect
 # ----------------------------------------------------------------
 def cmd_connect(args):
     real = get_real_hosts()
     alias = resolve_alias(real, args.alias, "Conectar a> ")
-    h = require_host(real, alias)
+    require_host(real, alias)
     print(f"\n{C.BOLD}Conectando a {alias}...{C.RESET}")
-
     if sys.stdout.isatty():
-        get_original_bg_color()          # query once before we change it
-        set_terminal_bg(terminal_bg_for_alias(alias))
+        get_original_bg_color()
+        set_terminal_bg(color_for_alias(alias))
         try:
             subprocess.run(['ssh', alias])
         finally:
@@ -572,82 +495,216 @@ def cmd_connect(args):
         subprocess.run(['ssh', alias])
 
 # ----------------------------------------------------------------
-# -show
+# list  (interactive selection connects)
 # ----------------------------------------------------------------
-def cmd_show(args):
-    if not args.alias:
-        err("-show requiere -alias")
-        sys.exit(1)
+def cmd_list(args):
     real = get_real_hosts()
-    h = require_host(real, args.alias)
-    display_host(h)
+    if not real:
+        warn("No hay hosts configurados. Usa: sshman add")
+        return
+
+    if args.plain:
+        print(f"\n{'Cliente':<14} {'Alias':<42} {'User@Host':<32} {'Jump':<30}")
+        print("─" * 118)
+        for h in real:
+            client = h['Host'].split('-')[0].upper()
+            userhost = f"{h.get('user','?')}@{h.get('hostname','?')}"
+            print(f"{client:<14} {h['Host']:<42} {userhost:<32} {jump_of(h)}")
+        print()
+        return
+
+    lines = []
+    for h in real:
+        client = h['Host'].split('-')[0].upper()
+        col2 = f"{h.get('user','?')}@{h.get('hostname','?')}"
+        jump = jump_of(h)
+        col3 = f"→ {jump}" if jump else ''
+        lines.append(f"{C.CYAN}{client:<12}{C.RESET} {h['Host']:<45} "
+                     f"{col2:<35} {C.DIM}{col3}{C.RESET}")
+    preview = ("echo {} | sed 's/\\x1b\\[[0-9;]*m//g' | awk '{print $2}' | "
+               "xargs -I% sh -c 'grep -A10 \"^Host %$\" ~/.sshman/config "
+               "2>/dev/null || echo \"(sin detalles)\"'")
+    selected = fzf_select(lines, prompt_str="Host (Enter=conectar)> ",
+                          preview_cmd=preview)
+    if not selected:
+        return
+    clean = re.sub(r'\033\[[0-9;]*m', '', selected).strip()
+    parts = clean.split()
+    if len(parts) < 2:
+        err("No se pudo extraer el alias de la selección.")
+        return
+    alias = parts[1]
+    require_host(real, alias)
+    # Selecting a host connects to it directly.
+    args.alias = alias
+    cmd_connect(args)
 
 # ----------------------------------------------------------------
-# -test
+# add
 # ----------------------------------------------------------------
+def cmd_add(args):
+    ensure_vault()
+    hosts, preamble = parse_config()
+
+    non_interactive = bool(args.alias and args.host and args.user)
+    if non_interactive:
+        alias, hostname, user = args.alias, args.host, args.user
+        port, jump, jump_key = args.port, args.jump, args.jump_key
+        key = args.key
+        env = args.env
+    else:
+        info("\n── Agregar nueva conexión ──────────────────────────\n")
+        alias    = prompt("Alias  (ej: ucuenca-prod-nuevo)", required=True)
+        hostname = prompt("Hostname / IP", required=True)
+        user     = prompt("Usuario", required=True)
+        port     = prompt("Puerto", default="22")
+        key      = args.key or prompt("Ruta llave .pem descargada  (vacío si no aplica)")
+        jump = jump_key = None
+        if confirm("¿Tiene bastión / jump server?"):
+            jump = prompt("  Jump  usuario@host:puerto", required=True)
+            jk = prompt("  Ruta llave jump .pem  (vacío si misma llave)")
+            jump_key = jk
+        env = prompt("Entorno (prod/test/dev/bastion/otro)", default="otro")
+
+    if get_host(hosts, alias):
+        err(f"El alias '{alias}' ya existe. Usa: sshman edit {alias}")
+        sys.exit(1)
+    if ' ' in alias:
+        err("El alias no puede contener espacios.")
+        sys.exit(1)
+    if port and not valid_port(port):
+        err(f"Puerto inválido: {port}")
+        sys.exit(1)
+
+    new = {'Host': alias, '_extra': [], 'hostname': hostname, 'user': user}
+    if port and port != '22':
+        new['port'] = port
+
+    # Install the key into the vault (copy + chmod 600)
+    if key:
+        new['identityfile'] = install_key(key, alias)
+        new['identitiesonly'] = 'yes'
+
+    if jump:
+        jk, jv = build_jump(jump, jump_key)
+        if not jk:
+            err(f"Jump inválido: '{jump}'. Formato: usuario@host:puerto")
+            sys.exit(1)
+        new[jk] = jv
+
+    # Insert near hosts of the same client prefix
+    client = alias.split('-')[0].lower()
+    insert_at = len(hosts)
+    for i, h in enumerate(hosts):
+        if h['Host'] != '*' and h['Host'].lower().startswith(client):
+            insert_at = i + 1
+
+    hosts.insert(insert_at, new)
+    write_config(hosts, preamble)
+
+    # Record env metadata
+    if env and env != 'otro':
+        meta = load_meta()
+        meta['hosts'][alias] = {'env': env}
+        save_meta(meta)
+
+    ok(f"'{alias}'  →  {user}@{hostname}" + (f"  (jump: {jump})" if jump else ""))
+
+    # Validate and optionally test-connect
+    print()
+    if _ssh_g_ok(alias) and sys.stdout.isatty() and not non_interactive:
+        if confirm("¿Conectar ahora para probar?"):
+            cmd_connect(argparse.Namespace(alias=alias))
+
+def _ssh_g_ok(alias):
+    try:
+        r = subprocess.run(['ssh', '-G', alias], capture_output=True,
+                           text=True, timeout=10)
+        if r.returncode == 0:
+            ok("Validación ssh -G correcta")
+            return True
+        err("ssh -G falló:")
+        if r.stderr:
+            print(f"  {r.stderr.strip()}")
+    except (subprocess.TimeoutExpired, FileNotFoundError) as e:
+        err(f"ssh -G: {e}")
+    return False
+
+# ----------------------------------------------------------------
+# show / test
+# ----------------------------------------------------------------
+def cmd_show(args):
+    real = get_real_hosts()
+    alias = args.alias or resolve_alias(real, None, "Ver> ")
+    display_host(require_host(real, alias))
+
 def cmd_test(args):
     real = get_real_hosts()
     alias = resolve_alias(real, args.alias, "Testear> ")
-    h = require_host(real, alias)
-
+    require_host(real, alias)
     print(f"\n{C.BOLD}Probando configuración para {alias}...{C.RESET}")
     try:
-        result = subprocess.run(
-            ['ssh', '-G', alias],
-            capture_output=True, text=True, timeout=10
-        )
-        if result.returncode == 0:
-            ok("ssh -G pasó correctamente")
-            # Show resolved config
-            print()
-            for line in result.stdout.strip().split('\n'):
-                parts = line.split(None, 1)
-                if len(parts) == 2:
-                    key, val = parts
-                    if key in ('hostname', 'user', 'port', 'identityfile',
-                               'proxycommand', 'proxyjump', 'stricthostkeychecking'):
-                        print(f"  {key:<25} {val}")
-        else:
-            err("ssh -G falló:")
-            if result.stderr:
-                print(f"  {result.stderr.strip()}")
-            sys.exit(1)
+        result = subprocess.run(['ssh', '-G', alias],
+                                capture_output=True, text=True, timeout=10)
     except subprocess.TimeoutExpired:
-        err("ssh -G timeout (10s)")
-        sys.exit(1)
+        err("ssh -G timeout (10s)"); sys.exit(1)
     except FileNotFoundError:
-        err("ssh no encontrado en PATH")
+        err("ssh no encontrado en PATH"); sys.exit(1)
+    if result.returncode != 0:
+        err("ssh -G falló:")
+        if result.stderr:
+            print(f"  {result.stderr.strip()}")
         sys.exit(1)
+    ok("ssh -G pasó correctamente")
+    print()
+    show_keys = ('hostname', 'user', 'port', 'identityfile',
+                 'proxycommand', 'proxyjump', 'stricthostkeychecking')
+    for line in result.stdout.strip().split('\n'):
+        parts = line.split(None, 1)
+        if len(parts) == 2 and parts[0] in show_keys:
+            print(f"  {parts[0]:<25} {parts[1]}")
     print()
 
 # ----------------------------------------------------------------
-# -remove
+# remove
 # ----------------------------------------------------------------
 def cmd_remove(args):
     hosts, preamble = parse_config()
     real = [h for h in hosts if h['Host'] != '*']
-
     alias = resolve_alias(real, args.alias, "Eliminar> ")
     host = require_host(real, alias)
 
     print(f"\n  {C.BOLD}{alias}{C.RESET}  →  "
           f"{host.get('user','?')}@{host.get('hostname','?')}")
-    confirm = input("  ¿Confirmar eliminación? [s/N]: ").strip().lower()
-    if confirm != 's':
-        warn("Cancelado.")
-        return
+    if not confirm("¿Confirmar eliminación?"):
+        warn("Cancelado."); return
 
+    # Offer to delete the associated key if it lives in the vault
+    keypath = host.get('identityfile', '')
     hosts = [h for h in hosts if h['Host'] != alias]
     write_config(hosts, preamble)
+
+    meta = load_meta()
+    if alias in meta['hosts']:
+        del meta['hosts'][alias]
+        save_meta(meta)
+
+    if keypath and str(KEYS_DIR) in keypath and Path(keypath).exists():
+        if confirm(f"¿Borrar también la llave {Path(keypath).name}?"):
+            try:
+                Path(keypath).unlink()
+                ok("Llave eliminada.")
+            except OSError as e:
+                err(f"No se pudo borrar la llave: {e}")
+
     ok(f"'{alias}' eliminado.")
 
 # ----------------------------------------------------------------
-# -edit
+# edit
 # ----------------------------------------------------------------
 def cmd_edit(args):
     hosts, preamble = parse_config()
     real = [h for h in hosts if h['Host'] != '*']
-
     alias = resolve_alias(real, args.alias, "Editar> ")
     host = require_host(real, alias)
 
@@ -659,185 +716,489 @@ def cmd_edit(args):
 
     new_port = prompt("Puerto", default=host.get('port', '22'))
     if new_port and new_port != '22':
-        try:
-            port_int = int(new_port)
-            if port_int < 1 or port_int > 65535:
-                err(f"Puerto inválido: {new_port}")
-                sys.exit(1)
-        except ValueError:
-            err(f"Puerto no es un número: {new_port}")
-            sys.exit(1)
+        if not valid_port(new_port):
+            err(f"Puerto inválido: {new_port}"); sys.exit(1)
         host['port'] = new_port
     else:
         host.pop('port', None)
 
-    new_key = prompt("Ruta llave .pem", default=host.get('identityfile', ''))
-    if new_key:
-        host['identityfile'] = os.path.expanduser(new_key)
-    elif 'identityfile' in host:
-        remove_key = input("  ¿Quitar la llave actual? [s/N]: ").strip().lower()
-        if remove_key == 's':
-            host.pop('identityfile', None)
+    new_key = prompt("Nueva llave .pem ('quitar' / Enter para mantener)")
+    if new_key and new_key.lower() != 'quitar':
+        host['identityfile'] = install_key(new_key, alias)
+        host['identitiesonly'] = 'yes'
+    elif new_key and new_key.lower() == 'quitar':
+        host.pop('identityfile', None)
+        host.pop('identitiesonly', None)
 
-    # Edit ProxyJump/ProxyCommand
-    current_jump = host.get('proxyjump', '')
-    current_pc = host.get('proxycommand', '')
-    has_jump = bool(current_jump or current_pc)
-
-    if has_jump:
-        jump_display = current_jump or current_pc
-        info(f"\n  Jump actual: {jump_display}")
-        new_jump = prompt("Nuevo jump (usuario@host:puerto / 'quitar' / Enter para mantener)",
-                          default=None)
+    # Jump
+    current = host.get('proxyjump') or host.get('proxycommand')
+    if current:
+        info(f"\n  Jump actual: {current}")
+        new_jump = prompt("Nuevo jump (usuario@host:puerto / 'quitar' / Enter)")
     else:
-        new_jump = prompt("Agregar jump server (usuario@host:puerto / Enter para omitir)",
-                          default=None)
-
-    if new_jump and new_jump.strip():
-        j_input = new_jump.strip()
-        if j_input.lower() == 'quitar':
+        new_jump = prompt("Agregar jump (usuario@host:puerto / Enter para omitir)")
+    if new_jump:
+        j = new_jump.strip()
+        if j.lower() == 'quitar':
             host.pop('proxyjump', None)
             host.pop('proxycommand', None)
-        elif '@' in j_input:
-            # Parse user@host:port
-            if ':' in j_input:
-                j_host_port = j_input.rsplit(':', 1)
-                j_host = j_host_port[0]
-                j_port = j_host_port[1]
-            else:
-                j_host = j_input
-                j_port = '22'
-            new_key_input = prompt("  Ruta llave jump .pem  (vacío si misma llave)")
-            if new_key_input:
-                nk = os.path.expanduser(new_key_input.strip())
-                host['proxycommand'] = f"ssh -W %h:%p -i {nk} {j_host} -p {j_port}"
-            else:
-                host['proxycommand'] = f"ssh -W %h:%p {j_host} -p {j_port}"
-            host.pop('proxyjump', None)
         else:
-            warn("Formato de jump inválido. Use usuario@host:puerto")
+            jk_path = prompt("  Ruta llave jump .pem  (vacío si misma llave)")
+            key_name, val = build_jump(j, jk_path)
+            if not key_name:
+                warn("Formato de jump inválido, se mantiene el actual.")
+            else:
+                host.pop('proxyjump', None)
+                host.pop('proxycommand', None)
+                host[key_name] = val
 
-    # Edit IdentitiesOnly
-    current_io = host.get('identitiesonly', '')
-    if current_io:
-        new_io = prompt("IdentitiesOnly (yes/no/quitar / Enter para mantener)",
-                        default=None)
-    else:
-        new_io = prompt("IdentitiesOnly (yes/no / Enter para omitir)",
-                        default=None)
-    if new_io and new_io.strip():
-        val = new_io.strip().lower()
-        if val == 'quitar':
-            host.pop('identitiesonly', None)
-        elif val in ('yes', 'no'):
-            host['identitiesonly'] = val
+    # Env metadata
+    meta = load_meta()
+    cur_env = meta['hosts'].get(alias, {}).get('env', '')
+    new_env = prompt("Entorno (prod/test/dev/bastion/otro / Enter para mantener)",
+                     default=cur_env or None)
+    if new_env:
+        meta['hosts'].setdefault(alias, {})['env'] = new_env
+        save_meta(meta)
 
     write_config(hosts, preamble)
     ok(f"'{alias}' actualizado.")
 
 # ----------------------------------------------------------------
-# -rename
+# rename
 # ----------------------------------------------------------------
 def cmd_rename(args):
     hosts, preamble = parse_config()
     real = [h for h in hosts if h['Host'] != '*']
+    old_alias = resolve_alias(real, args.alias, "Renombrar> ")
+    host = require_host(hosts, old_alias)
 
-    # Resolve current alias
-    if args.alias:
-        old_alias = args.alias
-    else:
-        old_alias = fzf_select([h['Host'] for h in real], prompt_str="Renombrar> ")
-    if not old_alias:
-        return
-
-    host = get_host(hosts, old_alias)
-    if not host:
-        err(f"No encontrado: '{old_alias}'")
-        sys.exit(1)
-
-    # Get new alias
-    if args.new_alias:
-        new_alias = args.new_alias
-    else:
-        new_alias = prompt(f"Nuevo alias para '{old_alias}'", required=True)
-
-    if not new_alias or not new_alias.strip():
-        err("El nuevo alias no puede estar vacío.")
-        sys.exit(1)
-
-    new_alias = new_alias.strip()
-
+    new_alias = args.new_alias or prompt(f"Nuevo alias para '{old_alias}'", required=True)
+    new_alias = (new_alias or '').strip()
+    if not new_alias:
+        err("El nuevo alias no puede estar vacío."); sys.exit(1)
     if ' ' in new_alias:
-        err("El alias no puede contener espacios.")
-        sys.exit(1)
-
+        err("El alias no puede contener espacios."); sys.exit(1)
     if get_host(hosts, new_alias):
-        err(f"El alias '{new_alias}' ya existe.")
-        sys.exit(1)
+        err(f"El alias '{new_alias}' ya existe."); sys.exit(1)
 
     host['Host'] = new_alias
+
+    # Rename key file if it belongs to the vault and matches old alias
+    kp = host.get('identityfile', '')
+    if kp and str(KEYS_DIR) in kp and Path(kp).exists():
+        old_key = Path(kp)
+        new_key = KEYS_DIR / f"{new_alias}{old_key.suffix}"
+        if not new_key.exists():
+            old_key.rename(new_key)
+            host['identityfile'] = str(new_key)
+            ok(f"Llave renombrada a {new_key.name}")
+
+    meta = load_meta()
+    if old_alias in meta['hosts']:
+        meta['hosts'][new_alias] = meta['hosts'].pop(old_alias)
+        save_meta(meta)
+
     write_config(hosts, preamble)
     ok(f"'{old_alias}' renombrado a '{new_alias}'.")
 
 # ----------------------------------------------------------------
+# migrate  (import existing ~/.ssh/config hosts into the vault)
+# ----------------------------------------------------------------
+def cmd_migrate(args):
+    ensure_vault()
+    if not SSH_CONFIG.exists():
+        warn("No existe ~/.ssh/config; nada que migrar.")
+        return
+
+    # Parse ~/.ssh/config directly (not the vault)
+    src_hosts, current = [], None
+    with open(SSH_CONFIG) as f:
+        for line in f:
+            s = line.strip()
+            if not s or s.startswith('#'):
+                continue
+            if s.lower().startswith('include'):
+                continue
+            m = re.match(r'^Host\s+(.+)$', s, re.IGNORECASE)
+            if m:
+                if current:
+                    src_hosts.append(current)
+                current = {'Host': m.group(1).strip(), '_extra': []}
+            elif current is not None:
+                m2 = re.match(r'^(\S+)\s+(.+)$', s)
+                if m2:
+                    key, val = m2.group(1).lower(), m2.group(2).strip()
+                    if key in KNOWN_SSH_OPTIONS:
+                        current[key] = val
+                    else:
+                        current['_extra'].append(line)
+        if current:
+            src_hosts.append(current)
+
+    src_hosts = [h for h in src_hosts if h['Host'] != '*']
+    if not src_hosts:
+        warn("No se encontraron hosts para migrar en ~/.ssh/config.")
+        return
+
+    vault_hosts, preamble = parse_config()
+    migrated = 0
+    for h in src_hosts:
+        if get_host(vault_hosts, h['Host']):
+            warn(f"'{h['Host']}' ya existe en el vault, se omite.")
+            continue
+        # Relocate key into the vault
+        kp = h.get('identityfile')
+        if kp:
+            src_key = Path(os.path.expanduser(kp))
+            if src_key.exists():
+                dst = KEYS_DIR / f"{h['Host']}{src_key.suffix or '.pem'}"
+                if not dst.exists():
+                    shutil.copy2(src_key, dst)
+                    os.chmod(dst, 0o600)
+                h['identityfile'] = str(dst)
+            else:
+                warn(f"Llave no encontrada para '{h['Host']}': {kp}")
+        vault_hosts.append(h)
+        migrated += 1
+
+    write_config(vault_hosts, preamble)
+    ok(f"Migrados {migrated} host(s) al vault.")
+    info("Revisa ~/.ssh/config y elimina manualmente los hosts duplicados "
+         "que ahora gestiona sshman (vía Include).")
+
+# ----------------------------------------------------------------
+# export / import  (portable, encrypted with openssl by default)
+# ----------------------------------------------------------------
+def _openssl_available():
+    return shutil.which('openssl') is not None
+
+def _ask_passphrase(confirm=False):
+    """Prompt for a passphrase via getpass (no echo). Optionally confirm."""
+    while True:
+        pw = getpass.getpass("Passphrase: ")
+        if not pw:
+            err("La passphrase no puede estar vacía."); sys.exit(1)
+        if confirm:
+            pw2 = getpass.getpass("Confirmar passphrase: ")
+            if pw != pw2:
+                err("Las passphrases no coinciden. Intenta de nuevo.")
+                continue
+        return pw
+
+def cmd_export(args):
+    ensure_vault()
+    ts = datetime.now().strftime("%Y%m%d")
+    default_name = f"sshman-vault-{ts}.tar.gz"
+    if not args.no_encrypt:
+        default_name += ".enc"
+    out = Path(args.output) if args.output else Path.cwd() / default_name
+
+    # Build tar.gz in a temp file
+    import tempfile
+    tmp = Path(tempfile.mktemp(suffix=".tar.gz"))
+    with tarfile.open(tmp, "w:gz") as tar:
+        for item in ("config", "keys", "meta.json"):
+            p = VAULT_DIR / item
+            if p.exists():
+                tar.add(p, arcname=item)
+
+    if args.no_encrypt:
+        warn("═════════════════════════════════════════════════════════")
+        warn(" Exportando SIN CIFRAR. El archivo contiene tus LLAVES")
+        warn(" PRIVADAS en texto plano. No lo subas a la nube ni lo")
+        warn(" envíes por canales inseguros.")
+        warn("═════════════════════════════════════════════════════════")
+        if not confirm("¿Continuar sin cifrar?"):
+            tmp.unlink(missing_ok=True)
+            warn("Cancelado."); return
+        shutil.move(str(tmp), str(out))
+        ok(f"Vault exportado (SIN CIFRAR): {out}")
+        return
+
+    if not _openssl_available():
+        err("openssl no encontrado; no se puede cifrar.")
+        warn("Puedes exportar sin cifrar con: sshman export --no-encrypt")
+        tmp.unlink(missing_ok=True)
+        sys.exit(1)
+
+    # Encrypt with openssl aes-256-cbc + pbkdf2
+    passphrase = _ask_passphrase(confirm=True)
+    env = dict(os.environ, SSHMAN_PASS=passphrase)
+    r = subprocess.run(
+        ['openssl', 'enc', '-aes-256-cbc', '-pbkdf2', '-salt',
+         '-pass', 'env:SSHMAN_PASS',
+         '-in', str(tmp), '-out', str(out)],
+        env=env,
+    )
+    passphrase = None
+    tmp.unlink(missing_ok=True)
+    if r.returncode != 0:
+        err("Fallo al cifrar con openssl."); sys.exit(1)
+    try:
+        os.chmod(out, 0o600)
+    except OSError:
+        pass
+    ok(f"Vault exportado y cifrado: {out}")
+    info("Para restaurar en otra máquina: sshman import " + out.name)
+
+def _looks_encrypted(path):
+    if str(path).endswith(".enc"):
+        return True
+    try:
+        with open(path, 'rb') as f:
+            return f.read(8) == b"Salted__"
+    except OSError:
+        return False
+
+def cmd_import(args):
+    src = Path(args.file)
+    if not src.exists() or not src.is_file():
+        err(f"Archivo no encontrado o no es un archivo: {src}"); sys.exit(1)
+    ensure_vault()
+
+    import tempfile
+    encrypted = _looks_encrypted(src)
+    if encrypted:
+        if not _openssl_available():
+            err("openssl no encontrado; no se puede descifrar."); sys.exit(1)
+        passphrase = _ask_passphrase(confirm=False)
+        env = dict(os.environ, SSHMAN_PASS=passphrase)
+        tmp = Path(tempfile.mktemp(suffix=".tar.gz"))
+        r = subprocess.run(
+            ['openssl', 'enc', '-d', '-aes-256-cbc', '-pbkdf2',
+             '-pass', 'env:SSHMAN_PASS',
+             '-in', str(src), '-out', str(tmp)],
+            env=env,
+        )
+        passphrase = None
+        if r.returncode != 0:
+            tmp.unlink(missing_ok=True)
+            err("Fallo al descifrar (¿passphrase incorrecta?)."); sys.exit(1)
+        tar_path = tmp
+    else:
+        warn("El archivo no parece cifrado.")
+        tar_path = src
+
+    # Backup current vault config before overwriting
+    if VAULT_CONF.exists():
+        backup_config()
+
+    with tarfile.open(tar_path, "r:gz") as tar:
+        members = []
+        vault_root = str(VAULT_DIR.resolve()) + os.sep
+        for member in tar.getmembers():
+            target = (VAULT_DIR / member.name).resolve()
+            managed = member.name.split('/')[0] in ('config', 'keys', 'meta.json')
+            if managed and str(target).startswith(vault_root) and \
+                    (member.isfile() or member.isdir()):
+                members.append(member)
+            elif managed:
+                err(f"Archivo de vault inseguro: {member.name}")
+                sys.exit(1)
+        for m in members:
+            tar.extract(m, path=VAULT_DIR)
+
+    if encrypted:
+        tar_path.unlink(missing_ok=True)
+
+    # Reescribir rutas de llaves al $HOME de esta máquina + chmod 600
+    _relocate_keys_paths()
+    for k in KEYS_DIR.glob("*"):
+        if k.is_file():
+            try:
+                os.chmod(k, 0o600)
+            except OSError:
+                pass
+
+    ensure_include()
+    ok("Vault importado correctamente.")
+    info("Ejecuta 'sshman doctor' para verificar la instalación.")
+
+def _relocate_keys_paths():
+    """Rewrite any IdentityFile/ProxyCommand key path so it points to this
+    machine's KEYS_DIR (handles a different $HOME after import)."""
+    hosts, preamble = parse_config()
+    changed = False
+    for h in hosts:
+        if 'identityfile' in h:
+            name = Path(h['identityfile']).name
+            candidate = KEYS_DIR / name
+            if candidate.exists() and h['identityfile'] != str(candidate):
+                h['identityfile'] = str(candidate)
+                changed = True
+        if 'proxycommand' in h and '/keys/' in h['proxycommand']:
+            new_pc = re.sub(r'-i\s+(\S+)',
+                            lambda m: f"-i {KEYS_DIR / Path(m.group(1)).name}",
+                            h['proxycommand'])
+            if new_pc != h['proxycommand']:
+                h['proxycommand'] = new_pc
+                changed = True
+    if changed:
+        write_config(hosts, preamble)
+
+# ----------------------------------------------------------------
+# doctor
+# ----------------------------------------------------------------
+def cmd_doctor(args):
+    ensure_vault()
+    problems = 0
+
+    # 1. Include present?
+    inc_ok = False
+    if SSH_CONFIG.exists():
+        for line in SSH_CONFIG.read_text().splitlines():
+            if line.strip().lower().startswith('include') and str(VAULT_CONF) in line:
+                inc_ok = True
+                break
+    if inc_ok:
+        ok("Include presente en ~/.ssh/config")
+    else:
+        problems += 1
+        err("Falta el Include en ~/.ssh/config")
+        if args.fix:
+            ensure_include()
+
+    # 2. Vault dir perms
+    hosts = get_real_hosts()
+    for h in hosts:
+        kp = h.get('identityfile')
+        if not kp:
+            warn(f"'{h['Host']}' no tiene IdentityFile")
+            continue
+        p = Path(kp)
+        if not p.exists():
+            problems += 1
+            err(f"'{h['Host']}': llave no existe → {kp}")
+            continue
+        mode = oct(p.stat().st_mode & 0o777)
+        if mode != '0o600':
+            problems += 1
+            err(f"'{h['Host']}': permisos {mode} en {p.name} (deben ser 600)")
+            if args.fix:
+                try:
+                    os.chmod(p, 0o600)
+                    ok(f"  Corregido a 600: {p.name}")
+                    problems -= 1
+                except OSError as e:
+                    err(f"  No se pudo corregir: {e}")
+        else:
+            ok(f"'{h['Host']}': llave OK ({p.name})")
+
+    print()
+    if problems == 0:
+        ok("Todo en orden.")
+    else:
+        warn(f"{problems} problema(s) detectado(s)."
+             + ("" if args.fix else " Ejecuta con --fix para corregir."))
+
+# ----------------------------------------------------------------
 # Main
 # ----------------------------------------------------------------
-def main():
-    parser = argparse.ArgumentParser(
+def build_parser():
+    p = argparse.ArgumentParser(
         prog='sshman',
-        description='Gestor de conexiones SSH — PolluxData',
+        description='Gestor de conexiones SSH portable — PolluxData',
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Ejemplos:
-  sshman -list
-  sshman -list --plain
-  sshman -connect
-  sshman -connect -alias polluxdata-sites
-  sshman -add
-  sshman -add -alias yoveri-oci-nuevo -host 172.19.1.200 -user opc
-  sshman -add -alias yoveri-oci-nuevo -host 172.19.1.200 -user opc \\
-         -key ~/.ssh/keys/YOVERI/OCI-BTA/nuevo.pem \\
-         -jump opc@149.130.180.28:22
-  sshman -remove
-  sshman -remove -alias yoveri-oci-nuevo
-  sshman -edit
-  sshman -edit -alias yoveri-oci-nuevo
-  sshman -show -alias polluxdata-sites
-  sshman -test -alias polluxdata-sites
-  sshman -rename -alias ucuenca-prod-nuevo -new-alias ucuenca-prod-viejo
-        """
-    )
+        epilog="""Ejemplos:
+  sshman list
+  sshman list --plain
+  sshman connect                 selector interactivo (Enter conecta)
+  sshman connect polluxdata-sites
+  sshman polluxdata-sites        atajo: conectar directo
+  sshman add                     asistente guiado
+  sshman add --key ~/Downloads/oci.pem
+  sshman edit ucuenca-prod
+  sshman rename viejo nuevo
+  sshman remove ucuenca-prod
+  sshman show polluxdata-sites
+  sshman test polluxdata-sites
+  sshman migrate                 importa ~/.ssh/config al vault
+  sshman export                  tar cifrado con openssl
+  sshman export --no-encrypt
+  sshman import sshman-vault-YYYYMMDD.tar.gz.enc
+  sshman doctor --fix
+""")
+    sub = p.add_subparsers(dest='cmd')
 
-    mode = parser.add_mutually_exclusive_group(required=True)
-    mode.add_argument('-add',     action='store_true')
-    mode.add_argument('-list',    action='store_true')
-    mode.add_argument('-remove',  action='store_true')
-    mode.add_argument('-edit',    action='store_true')
-    mode.add_argument('-rename',  action='store_true')
-    mode.add_argument('-connect', action='store_true')
-    mode.add_argument('-show',    action='store_true')
-    mode.add_argument('-test',    action='store_true')
+    sp = sub.add_parser('list', help='Listar hosts')
+    sp.add_argument('--plain', action='store_true', help='Salida en tabla (scripts)')
+    sp.set_defaults(func=cmd_list)
 
-    parser.add_argument('-alias',     help='Alias del host')
-    parser.add_argument('-new-alias', help='Nuevo alias (para -rename)')
-    parser.add_argument('-host',      help='Hostname o IP')
-    parser.add_argument('-user',      help='Usuario SSH')
-    parser.add_argument('-port',      help='Puerto (default: 22)')
-    parser.add_argument('-key',       help='Ruta llave .pem')
-    parser.add_argument('-jump',      help='Jump server usuario@host:puerto')
-    parser.add_argument('-jump-key',  dest='jump_key', help='Llave del jump server .pem')
-    parser.add_argument('--plain',    action='store_true', help='Modo no interactivo para -list')
+    sp = sub.add_parser('connect', help='Conectar a un host')
+    sp.add_argument('alias', nargs='?')
+    sp.set_defaults(func=cmd_connect)
 
-    args = parser.parse_args()
+    sp = sub.add_parser('add', help='Agregar un host')
+    sp.add_argument('--alias'); sp.add_argument('--host'); sp.add_argument('--user')
+    sp.add_argument('--port'); sp.add_argument('--key'); sp.add_argument('--jump')
+    sp.add_argument('--jump-key', dest='jump_key'); sp.add_argument('--env')
+    sp.set_defaults(func=cmd_add)
 
-    if   args.add:     cmd_add(args)
-    elif args.list:    cmd_list(args)
-    elif args.remove:  cmd_remove(args)
-    elif args.edit:    cmd_edit(args)
-    elif args.rename:  cmd_rename(args)
-    elif args.connect: cmd_connect(args)
-    elif args.show:    cmd_show(args)
-    elif args.test:    cmd_test(args)
+    sp = sub.add_parser('edit', help='Editar un host')
+    sp.add_argument('alias', nargs='?')
+    sp.set_defaults(func=cmd_edit)
+
+    sp = sub.add_parser('rename', help='Renombrar un host')
+    sp.add_argument('alias', nargs='?'); sp.add_argument('new_alias', nargs='?')
+    sp.set_defaults(func=cmd_rename)
+
+    sp = sub.add_parser('remove', help='Eliminar un host')
+    sp.add_argument('alias', nargs='?')
+    sp.set_defaults(func=cmd_remove)
+
+    sp = sub.add_parser('show', help='Ver detalles de un host')
+    sp.add_argument('alias', nargs='?')
+    sp.set_defaults(func=cmd_show)
+
+    sp = sub.add_parser('test', help='Validar con ssh -G')
+    sp.add_argument('alias', nargs='?')
+    sp.set_defaults(func=cmd_test)
+
+    sp = sub.add_parser('migrate', help='Importar ~/.ssh/config al vault')
+    sp.set_defaults(func=cmd_migrate)
+
+    sp = sub.add_parser('export', help='Exportar el vault (cifrado)')
+    sp.add_argument('-o', '--output')
+    sp.add_argument('--no-encrypt', action='store_true')
+    sp.set_defaults(func=cmd_export)
+
+    sp = sub.add_parser('import', help='Importar un vault exportado')
+    sp.add_argument('file')
+    sp.set_defaults(func=cmd_import)
+
+    sp = sub.add_parser('doctor', help='Diagnosticar y reparar el vault')
+    sp.add_argument('--fix', action='store_true')
+    sp.set_defaults(func=cmd_doctor)
+
+    return p
+
+def main():
+    parser = build_parser()
+    argv = sys.argv[1:]
+
+    # Shortcut: `sshman ALIAS` connects directly if ALIAS is not a subcommand.
+    known = {'list', 'connect', 'add', 'edit', 'rename', 'remove',
+             'show', 'test', 'migrate', 'export', 'import', 'doctor',
+             '-h', '--help'}
+    if argv and argv[0] not in known:
+        argv = ['connect', argv[0]]
+
+    args = parser.parse_args(argv)
+    if not getattr(args, 'cmd', None):
+        # No command: show host list as a friendly default.
+        ensure_vault()
+        cmd_list(argparse.Namespace(plain=False))
+        return
+
+    # Commands that mutate need the vault to exist first.
+    ensure_vault()
+    try:
+        args.func(args)
+    except KeyboardInterrupt:
+        print()
+        warn("Cancelado.")
+        sys.exit(130)
 
 if __name__ == '__main__':
     main()

@@ -138,15 +138,15 @@ def backup_config():
 def default_meta():
     return {
         "color_rules": {
-            "prod":    "#FFB3B3",
-            "test":    "#FFE0B3",
-            "staging": "#FFE0B3",
-            "dr":      "#FFE0B3",
-            "dev":     "#B3FFB3",
-            "lab":     "#B3FFB3",
-            "bastion": "#FFFFB3",
+            "prod":    "#2E1414",
+            "test":    "#2E2414",
+            "staging": "#2E2414",
+            "dr":      "#2E2414",
+            "dev":     "#142414",
+            "lab":     "#142414",
+            "bastion": "#241A2E",
         },
-        "default_color": "#B3D9FF",
+        "default_color": "#181A20",
         "hosts": {}
     }
 
@@ -382,38 +382,44 @@ def install_key(src_path, alias):
 _original_bg_color = None
 
 def _query_terminal_bg():
-    if not sys.stdout.isatty():
-        return None
-    fd = sys.stdin.fileno()
+    """Query the terminal's current bg color via OSC 11 (?), reading the
+    response from /dev/tty (not stdin) so it never leaks into the user's
+    interactive prompt.  Returns '#rrggbb' or None."""
     try:
-        old_settings = termios.tcgetattr(fd)
+        tty_fd = os.open('/dev/tty', os.O_RDWR)
+    except OSError:
+        return None
+    try:
+        old = termios.tcgetattr(tty_fd)
     except termios.error:
-        return None
+        os.close(tty_fd); return None
     try:
-        tty.setcbreak(fd)
-        sys.stdout.write("\033]11;?\007")
-        sys.stdout.flush()
-        response = ""
+        tty.setcbreak(tty_fd)
+        os.write(tty_fd, b"\033]11;?\007")
+        response = b""
+        deadline = 0.3
         while True:
-            ready, _, _ = select.select([sys.stdin], [], [], 0.5)
-            if not ready:
+            r, _, _ = select.select([tty_fd], [], [], deadline)
+            if not r:
                 break
-            char = sys.stdin.read(1)
-            if not char:
+            chunk = os.read(tty_fd, 256)
+            if not chunk:
                 break
-            response += char
-            if char in ("\007", "\033\\"):
+            response += chunk
+            if b"\007" in response or b"\033\\" in response:
                 break
-        m = re.search(r'rgb:([0-9a-fA-F]+)/([0-9a-fA-F]+)/([0-9a-fA-F]+)', response)
+        m = re.search(rb'rgb:([0-9a-fA-F]+)/([0-9a-fA-F]+)/([0-9a-fA-F]+)', response)
         if m:
-            return f"#{m.group(1)[:2]}{m.group(2)[:2]}{m.group(3)[:2]}"
+            return f"#{m.group(1)[:2].decode()}{m.group(2)[:2].decode()}{m.group(3)[:2].decode()}"
+        return None
     except Exception:
         return None
     finally:
         try:
-            termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+            termios.tcsetattr(tty_fd, termios.TCSADRAIN, old)
         except termios.error:
             pass
+        os.close(tty_fd)
 
 def get_original_bg_color():
     global _original_bg_color
@@ -427,8 +433,7 @@ def set_terminal_bg(color_hex):
 
 def restore_terminal_bg():
     original = get_original_bg_color()
-    sys.stdout.write(f"\033]11;{original}\007" if original else "\033]11;default\007")
-    sys.stdout.flush()
+    _write_osc11_tty(original or "default")
 
 # ----------------------------------------------------------------
 # fzf + prompt
@@ -485,16 +490,28 @@ def build_jump(jump, jump_key):
 # ----------------------------------------------------------------
 # connect
 # ----------------------------------------------------------------
+def _write_osc11_tty(color):
+    """Write OSC 11 directly to /dev/tty so the bg color is applied even
+    when the foreground process (ssh) has redirected stdout."""
+    try:
+        with open('/dev/tty', 'w') as tty:
+            tty.write(f"\033]11;{color}\007")
+            tty.flush()
+    except OSError:
+        set_terminal_bg(color)
+
 def cmd_connect(args):
     real = get_real_hosts()
     alias = resolve_alias(real, args.alias, "Conectar a> ")
     require_host(real, alias)
     print(f"\n{C.BOLD}Conectando a {alias}...{C.RESET}")
     if sys.stdout.isatty():
+        color = color_for_alias(alias)
         get_original_bg_color()
-        set_terminal_bg(color_for_alias(alias))
+        _write_osc11_tty(color)
+        ssh_cmd = ['ssh', '-t', alias]
         try:
-            subprocess.run(['ssh', alias])
+            subprocess.run(ssh_cmd)
         finally:
             restore_terminal_bg()
     else:
@@ -1160,7 +1177,9 @@ def cmd_doctor(args):
 def build_parser():
     p = argparse.ArgumentParser(
         prog='sshman',
-        description='Gestor de conexiones SSH portable — PolluxData',
+        description='Gestor de conexiones SSH portable — PolluxData\n'
+                    'Comandos: list, connect, add, edit, rename, remove, '
+                    'show, test, migrate, export, import, doctor',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""Ejemplos:
   sshman list
@@ -1181,56 +1200,177 @@ def build_parser():
   sshman import sshman-vault-YYYYMMDD.tar.gz.enc
   sshman doctor --fix
 """)
-    sub = p.add_subparsers(dest='cmd')
+    sub = p.add_subparsers(dest='cmd', title='Comandos', metavar='comando')
 
-    sp = sub.add_parser('list', help='Listar hosts')
-    sp.add_argument('--plain', action='store_true', help='Salida en tabla (scripts)')
+    fmt = argparse.RawDescriptionHelpFormatter
+
+    sp = sub.add_parser(
+        'list', help='Listar hosts', formatter_class=fmt,
+        description='Lista los hosts del vault en un selector interactivo (fzf). '
+                    'Al pulsar Enter sobre un host se conecta directamente. '
+                    'Sin fzf, o con --plain, imprime una tabla en pantalla.',
+        epilog="""Ejemplos:
+  sshman list                  selector fzf interactivo
+  sshman list --plain          tabla en texto plano (scripts / pipes)
+""")
+    sp.add_argument('--plain', action='store_true',
+                    help='Salida en tabla de texto plano, sin fzf')
     sp.set_defaults(func=cmd_list)
 
-    sp = sub.add_parser('connect', help='Conectar a un host')
-    sp.add_argument('alias', nargs='?')
+    sp = sub.add_parser(
+        'connect', help='Conectar a un host', formatter_class=fmt,
+        description='Conecta por SSH al host indicado. Si no se pasa alias '
+                    'abre el selector fzf. Cambia el color de fondo del '
+                    'terminal según el entorno del host (prod/test/dev/...).',
+        epilog="""Ejemplos:
+  sshman connect                       selector interactivo
+  sshman connect polluxdata-sites      directo
+  sshman polluxdata-sites              atajo equivalente
+""")
+    sp.add_argument('alias', nargs='?', help='Alias del host a conectar')
     sp.set_defaults(func=cmd_connect)
 
-    sp = sub.add_parser('add', help='Agregar un host')
-    sp.add_argument('--alias'); sp.add_argument('--host'); sp.add_argument('--user')
-    sp.add_argument('--port'); sp.add_argument('--key'); sp.add_argument('--jump')
-    sp.add_argument('--jump-key', dest='jump_key'); sp.add_argument('--env')
+    sp = sub.add_parser(
+        'add', help='Agregar un host', formatter_class=fmt,
+        description='Agrega una nueva conexión al vault. En modo interactivo '
+                    '(sin --alias/--host/--user) abre un asistente guiado. '
+                    'Los datos mínimos son alias, hostname y usuario. '
+                    'Opcionalmente se copia una llave .pem al vault, se '
+                    'configura un bastión/jump, y se asigna un entorno para '
+                    ' colorear el terminal al conectar.',
+        epilog="""Ejemplos:
+  sshman add                                    asistente guiado
+  sshman add --alias ucuenca-prod --host 1.2.3.4 --user opc --env prod
+  sshman add --alias web --host 10.0.0.5 --user ubuntu --key ~/Downloads/key.pem
+  sshman add --alias salto --host 10.0.0.5 --user opc \\
+      --jump bastion@192.168.1.10:22 --jump-key ~/Downloads/bastion.pem
+""")
+    sp.add_argument('--alias', help='Alias único para el host')
+    sp.add_argument('--host', help='Hostname o IP del destino')
+    sp.add_argument('--user', help='Usuario SSH')
+    sp.add_argument('--port', help='Puerto SSH (por defecto 22)')
+    sp.add_argument('--key', help="Ruta a la llave .pem descargada (se copia al vault)")
+    sp.add_argument('--jump', help='Bastión/jump en formato usuario@host:puerto')
+    sp.add_argument('--jump-key', dest='jump_key',
+                    help='Llave .pem del bastión (si difiere de la del destino)')
+    sp.add_argument('--env',
+                    help="Entorno: prod/test/dev/staging/dr/lab/bastion/otro")
     sp.set_defaults(func=cmd_add)
 
-    sp = sub.add_parser('edit', help='Editar un host')
-    sp.add_argument('alias', nargs='?')
+    sp = sub.add_parser(
+        'edit', help='Editar un host', formatter_class=fmt,
+        description='Edita interactivamente los parámetros de un host '
+                    'existente: hostname, usuario, puerto, llave, jump y '
+                    'entorno. Pulsar Enter mantiene el valor actual. Para '
+                    'quitar llave o jump escribe "quitar" cuando se pregunte.',
+        epilog="""Ejemplos:
+  sshman edit                 selector + edición interactiva
+  sshman edit ucuenca-prod    edita directamente ese host
+""")
+    sp.add_argument('alias', nargs='?', help='Alias del host a editar')
     sp.set_defaults(func=cmd_edit)
 
-    sp = sub.add_parser('rename', help='Renombrar un host')
-    sp.add_argument('alias', nargs='?'); sp.add_argument('new_alias', nargs='?')
+    sp = sub.add_parser(
+        'rename', help='Renombrar un host', formatter_class=fmt,
+        description='Cambia el alias de un host. Renombra también la llave '
+                    'asociada en el vault (si vive en ~/.sshman/keys/) y '
+                    'actualiza la metadata de entorno.',
+        epilog="""Ejemplos:
+  sshman rename                       selector + prompt
+  sshman rename viejo nuevo           directo (posicional)
+""")
+    sp.add_argument('alias', nargs='?', help='Alias actual')
+    sp.add_argument('new_alias', nargs='?', help='Nuevo alias')
     sp.set_defaults(func=cmd_rename)
 
-    sp = sub.add_parser('remove', help='Eliminar un host')
-    sp.add_argument('alias', nargs='?')
+    sp = sub.add_parser(
+        'remove', help='Eliminar un host', formatter_class=fmt,
+        description='Elimina un host del vault. Pide confirmación y ofrece '
+                    'borrar la llave privada asociada si vive dentro del vault.',
+        epilog="""Ejemplos:
+  sshman remove                selector + confirmación
+  sshman remove ucuenca-prod   directo (con confirmación)
+""")
+    sp.add_argument('alias', nargs='?', help='Alias del host a eliminar')
     sp.set_defaults(func=cmd_remove)
 
-    sp = sub.add_parser('show', help='Ver detalles de un host')
-    sp.add_argument('alias', nargs='?')
+    sp = sub.add_parser(
+        'show', help='Ver detalles de un host', formatter_class=fmt,
+        description='Muestra los detalles de un host: HostName, User, Port, '
+                    'IdentityFile, ProxyJump/ProxyCommand y entorno.',
+        epilog="""Ejemplos:
+  sshman show                  selector
+  sshman show polluxdata-sites directo
+""")
+    sp.add_argument('alias', nargs='?', help='Alias del host a mostrar')
     sp.set_defaults(func=cmd_show)
 
-    sp = sub.add_parser('test', help='Validar con ssh -G')
-    sp.add_argument('alias', nargs='?')
+    sp = sub.add_parser(
+        'test', help='Validar con ssh -G', formatter_class=fmt,
+        description='Ejecuta "ssh -G <alias>" para validar que la '
+                    'configuración resuelve correctamente y muestra los '
+                    'parámetros efectivos que usaría ssh.',
+        epilog="""Ejemplos:
+  sshman test                  selector
+  sshman test polluxdata-sites directo
+""")
+    sp.add_argument('alias', nargs='?', help='Alias del host a testear')
     sp.set_defaults(func=cmd_test)
 
-    sp = sub.add_parser('migrate', help='Importar ~/.ssh/config al vault')
+    sp = sub.add_parser(
+        'migrate', help='Importar ~/.ssh/config al vault', formatter_class=fmt,
+        description='Importa los hosts definidos manualmente en ~/.ssh/config '
+                    'al vault de sshman. Copia las llaves IdentityFile (renombradas '
+                    'a <alias>.pem) y las llaves referenciadas en ProxyCommand -i '
+                    '(con su nombre original) a ~/.sshman/keys/. Los hosts que ya '
+                    'existían en el vault se omiten.',
+        epilog="""Ejemplos:
+  sshman migrate               migra todos los hosts de ~/.ssh/config
+""")
     sp.set_defaults(func=cmd_migrate)
 
-    sp = sub.add_parser('export', help='Exportar el vault (cifrado)')
-    sp.add_argument('-o', '--output')
-    sp.add_argument('--no-encrypt', action='store_true')
+    sp = sub.add_parser(
+        'export', help='Exportar el vault (cifrado)', formatter_class=fmt,
+        description='Exporta el vault (config, llaves y meta.json) a un '
+                    'archivo .tar.gz cifrado con openssl aes-256-cbc + pbkdf2. '
+                    'La passphrase se pide sin eco. El archivo resultante se '
+                    'deja con permisos 600.',
+        epilog="""Ejemplos:
+  sshman export                               cifra con passphrase
+  sshman export -o /tmp/mi-vault.enc          ruta destino
+  sshman export --no-encrypt                  SIN cifrar (¡inseguro!)
+""")
+    sp.add_argument('-o', '--output',
+                    help='Ruta del archivo destino (por defecto ./sshman-vault-FECHA.tar.gz.enc)')
+    sp.add_argument('--no-encrypt', action='store_true',
+                    help='Exportar SIN cifrar (las llaves quedan en texto plano)')
     sp.set_defaults(func=cmd_export)
 
-    sp = sub.add_parser('import', help='Importar un vault exportado')
-    sp.add_argument('file')
+    sp = sub.add_parser(
+        'import', help='Importar un vault exportado', formatter_class=fmt,
+        description='Restaura un vault exportado por sshman en otra máquina. '
+                    'Detecta automáticamente si el archivo está cifrado y pide '
+                    'la passphrase. Reescribe las rutas de las llaves para '
+                    'apuntar al $HOME actual y repara los permisos a 600.',
+        epilog="""Ejemplos:
+  sshman import sshman-vault-20240115.tar.gz.enc
+  sshman import /tmp/vault.tar.gz
+""")
+    sp.add_argument('file', help='Archivo de vault exportado (.tar.gz o .enc)')
     sp.set_defaults(func=cmd_import)
 
-    sp = sub.add_parser('doctor', help='Diagnosticar y reparar el vault')
-    sp.add_argument('--fix', action='store_true')
+    sp = sub.add_parser(
+        'doctor', help='Diagnosticar y reparar el vault', formatter_class=fmt,
+        description='Verifica la integridad del vault: presencia del Include '
+                    'en ~/.ssh/config, existencia y permisos 600 de cada '
+                    'llave (IdentityFile y ProxyCommand). Con --fix corrige '
+                    'automáticamente el Include y los permisos.',
+        epilog="""Ejemplos:
+  sshman doctor            solo diagnóstico
+  sshman doctor --fix      diagnóstico + corrección automática
+""")
+    sp.add_argument('--fix', action='store_true',
+                    help='Corregir automáticamente problemas detectados')
     sp.set_defaults(func=cmd_doctor)
 
     return p

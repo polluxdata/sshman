@@ -175,6 +175,13 @@ sshman doctor --fix    # corrige permisos y Include
 
 ## Comandos
 
+Cada subcomando tiene `--help` detallado (descripción, flags y ejemplos):
+
+```bash
+sshman add --help
+sshman export --help
+```
+
 | Comando    | Descripción                                        |
 |------------|----------------------------------------------------|
 | `list`     | Listar hosts (interactivo; `--plain` para tabla)   |
@@ -207,24 +214,65 @@ sshman doctor --fix    # corrige permisos y Include
 
 ## Colores por entorno
 
+Al conectar, sshman cambia el **fondo del terminal** según el entorno del host (OSC 11) y lo **restaura** al salir. La paleta por defecto usa **acentos discretos** (tonos oscuros) para no romper la legibilidad:
+
+| Env       | Color     | Tinte          |
+|-----------|----------|----------------|
+| `prod`    | `#2E1414` | rojo oscuro    |
+| `test`    | `#2E2414` | ámbar oscuro   |
+| `staging` | `#2E2414` | ámbar oscuro   |
+| `dr`      | `#2E2414` | ámbar oscuro   |
+| `dev`     | `#142414` | verde oscuro   |
+| `lab`     | `#142414` | verde oscuro   |
+| `bastion` | `#241A2E` | violeta oscuro |
+| *(default)* | `#181A20` | slate neutro |
+
 Configurables en `~/.sshman/meta.json`:
 
 ```json
 {
   "color_rules": {
-    "prod": "#FFB3B3",
-    "test": "#FFE0B3",
-    "dev":  "#B3FFB3",
-    "bastion": "#FFFFB3"
+    "prod":    "#2E1414",
+    "dev":     "#142414",
+    "bastion": "#241A2E"
   },
-  "default_color": "#B3D9FF",
+  "default_color": "#181A20",
   "hosts": {
-    "acme-prod-api": { "env": "prod", "color": "#FF0000" }
+    "acme-prod-api": { "env": "prod", "color": "#3A0000" }
   }
 }
 ```
 
 Prioridad: `color` explícito del host → regla del `env` del host → `default_color`. La metadata viaja en el export/import.
+
+> **Nota**: el color del fondo se captura antes de cambiarlo (OSC 11 `?`) y se restaura exacto al salir. Si tu terminal no responde a OSC 11, se restaura a `"default"`. Un `color` explícito por host siempre tiene prioridad.
+
+---
+
+## Autocompletado (zsh)
+
+El repo incluye `_sshman` (función de autocompletado zsh). Completa subcomandos, flags y **aliases del vault**.
+
+Instalación:
+
+```bash
+# Opción A: copiar a un directorio de $fpath
+cp _sshman /opt/homebrew/share/zsh/site-functions/_sshman   # macOS (Homebrew)
+cp _sshman /usr/local/share/zsh/site-functions/_sshman       # Linux
+
+# Opción B: añadir el dir del repo a fpath (útil en dev)
+# en ~/.zshrc:  fpath+=(/ruta/al/repo/sshman)
+
+rm -f ~/.zcompdump* && exec zsh
+```
+
+Después:
+
+```bash
+sshman <Tab>            # subcomandos + aliases del vault
+sshman connect <Tab>    # solo aliases
+sshman add --<Tab>      # flags de add
+```
 
 ---
 

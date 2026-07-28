@@ -8,6 +8,7 @@
 ## Estructura del repo
 
 - `sshman` — script principal (Python 3.7+, solo stdlib + fzf + openssl)
+- `_sshman` — función de autocompletado zsh (subcomandos, flags y aliases del vault)
 - `README.md` — documentación de usuario
 - `AGENTS.md` — este archivo
 
@@ -55,3 +56,13 @@ user.email = fjandrade@polluxdata.com
   `getpass` y se pasa a openssl como `env:SSHMAN_PASS`.
 - `doctor` valida `IdentityFile` + llaves de `ProxyCommand`, permisos `600`, y el `Include`.
 - Los valores del SSH config se parsean eliminando comillas envolventes (`_unquote`).
+- **Color de terminal (OSC 11)**: al conectar, sshman captura el fondo actual vía query OSC 11
+  `?` leída de `/dev/tty` (no de `stdin`, para no filtrar la respuesta al prompt), cambia el
+  fondo al color del entorno del host, lo re-afirma con `LocalCommand` tras `ssh -t`, y restaura
+  el color original al desconectar. Si la query OSC 11 falla, restaura a `"default"`.
+- **Paleta de colores**: acentos discretos (tonos oscuros) en `meta.json` para no romper
+  legibilidad. La paleta por defecto (espesa negra con tinte) está en `default_meta()`.
+- **`--help` por subcomando**: cada subparser tiene `description` + `epilog` con ejemplos.
+- **Autocompletado zsh** (`_sshman`): completa subcomandos, flags y aliases del vault leyendo
+  `~/.sshman/config`. Usa solo `compadd -a` (sin `_describe`/`_alternative` que rompen en
+  algunos zsh).

@@ -1,0 +1,48 @@
+#compdef sshman
+# Autocompletado zsh para sshman.
+
+_sshman() {
+  local -a hosts
+  local cfg="$HOME/.sshman/config"
+  if [[ -r "$cfg" ]]; then
+    hosts=(${(f)"$(grep -iE '^Host[[:space:]]+' "$cfg" | awk '{print $2}' | grep -v '\*')"})
+  fi
+
+  local -a cmds
+  cmds=(list connect add edit rename remove show test migrate export import doctor)
+
+  if (( CURRENT == 2 )); then
+    _wanted cmd expl 'comando' compadd -a cmds
+    _wanted host expl 'alias' compadd -a hosts
+    return
+  fi
+
+  local cmd=${words[2]}
+  case $cmd in
+    list)
+      compadd --plain
+      ;;
+    connect|show|test|remove|edit)
+      _wanted host expl 'alias' compadd -a hosts
+      ;;
+    rename)
+      if (( CURRENT == 3 )); then
+        _wanted host expl 'alias actual' compadd -a hosts
+      fi
+      ;;
+    add)
+      compadd --alias --host --user --port --key --jump --jump-key --env
+      ;;
+    export)
+      compadd -- -o --output --no-encrypt
+      ;;
+    import)
+      _files
+      ;;
+    doctor)
+      compadd -- --fix
+      ;;
+  esac
+}
+
+_sshman "$@"
